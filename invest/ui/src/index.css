@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+    * {
+        box-sizing: border-box;
+    }
+
+    html,
+    body,
+    #root {
+        height: 100%;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+    }
+
+    body {
+        font-family: 'PingFang SC', 'Microsoft YaHei', Inter, system-ui, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: #1e293b;
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: #334155;
+        border-radius: 3px;
+    }
+}
+
+@layer utilities {
+    .text-bull {
+        color: #ef4444;
+    }
+
+    /* red = up price (Chinese convention) */
+    .text-bear {
+        color: #22c55e;
+    }
+
+    /* green = down price */
+    .bg-bull {
+        background-color: #ef4444;
+    }
+
+    .bg-bear {
+        background-color: #22c55e;
+    }
+}
