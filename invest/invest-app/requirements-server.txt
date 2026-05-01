@@ -1,0 +1,28 @@
+# Runtime-only requirements for the FastAPI server (Tauri sidecar).
+# Does NOT include CLI-only or dev-only packages, keeping the bundle small.
+#
+# Packages intentionally excluded (not needed by the server):
+#   dash, plotly     – only used by `invest web` CLI dashboard
+#   matplotlib       – only used by `invest chart` CLI command
+#   rich, click      – only used by CLI entry-point
+#
+# Usage (create a clean production venv before `cargo tauri build`):
+#   cd invest-app
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements-server.txt
+#   pip install -e . --no-deps
+
+yfinance>=0.2.30
+pandas>=2.0.0
+numpy>=1.24.0
+pydantic>=2.0.0
+
+# FastAPI backend
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Agent framework (optional – server degrades gracefully without it;
+# remove this line to save ~150 MB if agent endpoints are not needed)
+langgraph>=0.2.0

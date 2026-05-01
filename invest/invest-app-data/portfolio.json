@@ -1,0 +1,37 @@
+{
+  "name": "My Portfolio",
+  "holdings": {
+    "600519.SS": {
+      "ticker": "600519.SS",
+      "shares": 100.0,
+      "avg_cost_basis": 1455.02,
+      "asset_type": "stock",
+      "transactions": [
+        {
+          "type": "buy",
+          "ticker": "600519.SS",
+          "shares": 100.0,
+          "price_per_share": 1455.02,
+          "date": "2026-02-27T21:05:56.817572"
+        }
+      ]
+    },
+    "AAPL": {
+      "ticker": "AAPL",
+      "shares": 10.0,
+      "avg_cost_basis": 150.0,
+      "asset_type": "stock",
+      "transactions": [
+        {
+          "type": "buy",
+          "ticker": "AAPL",
+          "shares": 10.0,
+          "price_per_share": 150.0,
+          "date": "2026-02-27T22:16:21.633514"
+        }
+      ]
+    }
+  },
+  "created_at": "2026-02-27T21:05:56.817572",
+  "updated_at": "2026-02-27T22:16:21.634565"
+}

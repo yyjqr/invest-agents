@@ -1,0 +1,140 @@
+{
+  "records": [
+    {
+      "ticker": "300098.SZ",
+      "name": "高新兴",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 6.28,
+      "timestamp": "2026-03-01T07:10:47"
+    },
+    {
+      "ticker": "002179.SZ",
+      "name": "中航光电",
+      "action": "持有观察",
+      "sector": "其他",
+      "price": 35.55,
+      "timestamp": "2026-03-01T07:36:39"
+    },
+    {
+      "ticker": "002415.SZ",
+      "name": "海康威视",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 31.44,
+      "timestamp": "2026-03-01T07:52:16"
+    },
+    {
+      "ticker": "300024.SZ",
+      "name": "机器人",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 17.5,
+      "timestamp": "2026-03-01T08:08:06"
+    },
+    {
+      "ticker": "002600.SZ",
+      "name": "领益智造",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 15.38,
+      "timestamp": "2026-03-01T08:08:06"
+    },
+    {
+      "ticker": "600900.SS",
+      "name": "长江电力",
+      "action": "等待企稳",
+      "sector": "电力/能源",
+      "price": 26.04,
+      "timestamp": "2026-03-01T08:10:09"
+    },
+    {
+      "ticker": "600779.SS",
+      "name": "水井坊",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 38.28,
+      "timestamp": "2026-03-01T08:13:51"
+    },
+    {
+      "ticker": "516780.SS",
+      "name": "稀土ETF",
+      "action": "可分批止盈",
+      "sector": "有色金属",
+      "price": 2.226,
+      "timestamp": "2026-03-01T08:22:59"
+    },
+    {
+      "ticker": "512400.SS",
+      "name": "有色金属ETF",
+      "action": "可分批止盈",
+      "sector": "有色金属",
+      "price": 2.498,
+      "timestamp": "2026-03-02T21:53:48"
+    },
+    {
+      "ticker": "000630.SZ",
+      "name": "铜陵有色",
+      "action": "持有观察",
+      "sector": "有色金属",
+      "price": 8.42,
+      "timestamp": "2026-03-02T23:16:35"
+    },
+    {
+      "ticker": "000878.SZ",
+      "name": "云南铜业",
+      "action": "持有观察",
+      "sector": "科技",
+      "price": 26.69,
+      "timestamp": "2026-03-02T23:17:02"
+    },
+    {
+      "ticker": "301308.SZ",
+      "name": "江波龙",
+      "action": "持有观察",
+      "sector": "其他",
+      "price": 301.99,
+      "timestamp": "2026-03-04T20:06:31"
+    },
+    {
+      "ticker": "002209.SZ",
+      "name": "达 意 隆",
+      "action": "持有观察",
+      "sector": "其他",
+      "price": 14.87,
+      "timestamp": "2026-03-04T20:19:00"
+    },
+    {
+      "ticker": "600584.SS",
+      "name": "长电科技",
+      "action": "持有观察",
+      "sector": "科技",
+      "price": 47.86,
+      "timestamp": "2026-03-04T20:27:21"
+    },
+    {
+      "ticker": "600498.SS",
+      "name": "烽火通信",
+      "action": "可分批止盈",
+      "sector": "科技",
+      "price": 58.44,
+      "timestamp": "2026-03-04T21:02:10"
+    },
+    {
+      "ticker": "603108.SS",
+      "name": "润达医疗",
+      "action": "等待企稳",
+      "sector": "其他",
+      "price": 14.4,
+      "timestamp": "2026-03-04T21:04:48"
+    },
+    {
+      "ticker": "603986.SS",
+      "name": "兆易创新",
+      "action": "持有观察",
+      "sector": "其他",
+      "price": 279.07,
+      "timestamp": "2026-03-04T22:03:55"
+    }
+  ]
+}
