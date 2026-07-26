@@ -218,6 +218,33 @@ fn kill_server_on_8765() {
     }
 }
 
+/// Format current local time as "YYYY-MM-DD HH:MM:SS" (local timezone via chrono).
+fn local_timestamp() -> String {
+    let dt = chrono::Local::now();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Append a timestamped session-start banner to the log file.
+/// Each Tauri launch gets a clearly delimited block so stale logs don't
+/// blend with the current session.
+fn write_log_banner(log_path: &std::path::Path, python: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let ts = local_timestamp();
+        let _ = writeln!(
+            f,
+            "\n========== INVEST-APP SERVER START {} ==========",
+            ts
+        );
+        let _ = writeln!(f, "Python: {python}");
+        let _ = writeln!(f, "PID (Tauri): {}", std::process::id());
+    }
+}
+
 /// Spawn the FastAPI backend.  Returns the child process handle.
 fn start_python_server(python: &str) -> std::io::Result<Child> {
     // ⚠ IMPORTANT: Do NOT set current_dir to invest-app/.
@@ -239,6 +266,10 @@ fn start_python_server(python: &str) -> std::io::Result<Child> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("python-server.log")))
         .unwrap_or_else(|| "python-server.log".into());
+
+    // Write a timestamped session banner before each spawn so the log has a
+    // clear delimiter even if Python exits immediately (e.g. EADDRINUSE).
+    write_log_banner(&log_path, python);
 
     let stderr_sink = std::fs::OpenOptions::new()
         .create(true)
@@ -280,6 +311,44 @@ fn start_python_server(python: &str) -> std::io::Result<Child> {
     Ok(child)
 }
 
+/// Open a URL in the default system browser.
+/// Only http:// and https:// URLs are accepted (security guard).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("Only http/https URLs are permitted".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // PowerShell Start-Process handles URLs with query strings reliably.
+        // Escape single-quotes so the PS string literal stays intact.
+        let safe = url.replace('\'', "''");
+        std::process::Command::new("powershell.exe")
+            .args(["-NonInteractive", "-NoProfile", "-WindowStyle", "Hidden",
+                   "-Command", &format!("Start-Process '{safe}'")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_server_url() -> String {
     "http://127.0.0.1:8765".to_string()
@@ -314,7 +383,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![get_server_url, fetch_av_quote, trigger_price_alert])
+        .invoke_handler(tauri::generate_handler![open_url, get_server_url, fetch_av_quote, trigger_price_alert])
         .setup(move |app| {
             // ── Start Python FastAPI server ──────────────────────────────
             // Strategy: probe /health first.
@@ -329,15 +398,20 @@ pub fn run() {
             } else {
                 // Evict any stale/orphan process that may be holding the port
                 if std::net::TcpStream::connect("127.0.0.1:8765").is_ok() {
-                    log::info!("Port 8765 occupied but not healthy — evicting stale server");
+                    log::info!("[{}] Port 8765 occupied but not healthy — evicting stale server", local_timestamp());
                     kill_server_on_8765();
 
-                    // Verify kill succeeded; retry if port is still occupied
+                    // Verify kill succeeded; retry with increasing backoff
                     if std::net::TcpStream::connect("127.0.0.1:8765").is_ok() {
-                        log::warn!("Port 8765 still occupied after first kill — retrying");
+                        log::warn!("[{}] Port 8765 still occupied after first kill — retrying (2 s)", local_timestamp());
+                        std::thread::sleep(std::time::Duration::from_millis(2000));
                         kill_server_on_8765();
                         if std::net::TcpStream::connect("127.0.0.1:8765").is_ok() {
-                            log::error!("Port 8765 STILL occupied after two kill attempts");
+                            log::warn!("[{}] Port 8765 still occupied after second kill — final wait (3 s)", local_timestamp());
+                            std::thread::sleep(std::time::Duration::from_millis(3000));
+                            if std::net::TcpStream::connect("127.0.0.1:8765").is_ok() {
+                                log::error!("[{}] Port 8765 STILL occupied — Python spawn will likely fail with EADDRINUSE", local_timestamp());
+                            }
                         }
                     }
                 }
@@ -355,30 +429,44 @@ pub fn run() {
                         match child.try_wait() {
                             Ok(Some(status)) => {
                                 log::error!(
-                                    "Python server exited immediately (status: {status}). \
-                                     Killing port 8765 and retrying..."
+                                    "[{}] Python server exited immediately (status: {status}). \
+                                     Killing port 8765 and retrying...",
+                                    local_timestamp()
                                 );
                                 kill_server_on_8765();
+                                // Extra wait for OS to release port before retry
+                                std::thread::sleep(std::time::Duration::from_millis(2000));
                                 match start_python_server(&python) {
-                                    Ok(child2) => {
-                                        log::info!(
-                                            "Retry: Python server started (pid {})",
-                                            child2.id()
-                                        );
-                                        *python_proc_clone.lock().unwrap() = Some(child2);
+                                    Ok(mut child2) => {
+                                        // Give the retry spawn another 3 s to confirm liveness
+                                        std::thread::sleep(std::time::Duration::from_millis(3000));
+                                        match child2.try_wait() {
+                                            Ok(Some(s2)) => log::error!(
+                                                "[{}] Retry also exited immediately (status: {s2})",
+                                                local_timestamp()
+                                            ),
+                                            _ => {
+                                                log::info!(
+                                                    "[{}] Retry: Python server alive (pid {})",
+                                                    local_timestamp(),
+                                                    child2.id()
+                                                );
+                                                *python_proc_clone.lock().unwrap() = Some(child2);
+                                            }
+                                        }
                                     }
                                     Err(e2) => {
-                                        log::error!("Retry: failed to start Python server: {e2}");
+                                        log::error!("[{}] Retry: failed to start Python server: {e2}", local_timestamp());
                                     }
                                 }
                             }
                             Ok(None) => {
                                 // Still running — all good
-                                log::info!("Python server alive after 2 s – startup OK");
+                                log::info!("[{}] Python server alive after 2 s – startup OK", local_timestamp());
                                 *python_proc_clone.lock().unwrap() = Some(child);
                             }
                             Err(e) => {
-                                log::warn!("Could not check Python child status: {e}");
+                                log::warn!("[{}] Could not check Python child status: {e}", local_timestamp());
                                 *python_proc_clone.lock().unwrap() = Some(child);
                             }
                         }

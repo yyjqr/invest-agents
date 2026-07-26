@@ -12,6 +12,9 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import yfinance as yf
 
+from invest_app.cache import read_history_cache, write_history_cache
+from invest_app.config import get_alpha_vantage_key
+
 # Max seconds to wait for a single yfinance network call.
 _YF_TIMEOUT = 8
 
@@ -445,11 +448,79 @@ def resolve_ticker(query: str) -> str:
     return q
 
 
+def _cn_ticker_to_av_symbol(ticker: str) -> str | None:
+    """Convert a CN A-share ticker to Alpha Vantage symbol format.
+
+    Shanghai (sh) → CODE.SHG, Shenzhen (sz) → CODE.SHZ.
+    Returns None for non-CN tickers.
+    """
+    prefix = _cn_market_prefix(ticker)
+    if prefix is None:
+        return None
+    code = ticker.strip().upper().split(".", maxsplit=1)[0]
+    return f"{code}.SHG" if prefix == "sh" else f"{code}.SHZ"
+
+
+def _try_alpha_vantage_quote(ticker: str) -> Quote | None:
+    """Tertiary fallback quote via Alpha Vantage GLOBAL_QUOTE endpoint.
+
+    Requires ALPHA_VANTAGE_KEY env variable or api_keys.json entry.
+    Free tier: 25 req/day (sufficient for personal use).
+    Premium plans unlock higher throughput if needed.
+    """
+    api_key = get_alpha_vantage_key()
+    if not api_key:
+        return None
+
+    # Determine symbol: CN A-share → CODE.SHG / CODE.SHZ, otherwise direct
+    av_symbol = _cn_ticker_to_av_symbol(ticker)
+    if av_symbol is None:
+        av_symbol = normalize_ticker(ticker)  # e.g. AAPL, 9988.HK
+
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=GLOBAL_QUOTE&symbol={av_symbol}&apikey={api_key}"
+    )
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8"))
+    except (OSError, URLError, ValueError):
+        return None
+
+    gq = data.get("Global Quote") or {}
+    price_str = gq.get("05. price", "").strip()
+    if not price_str:
+        return None  # quota exceeded or unknown ticker
+
+    try:
+        price = float(price_str)
+        change = float(gq.get("09. change", "0") or "0")
+        pct_raw = (gq.get("10. change percent") or "0%").strip("%")
+        change_pct = float(pct_raw) if pct_raw else 0.0
+    except ValueError:
+        return None
+
+    code = ticker.strip().upper().split(".", maxsplit=1)[0]
+    return Quote(
+        ticker=normalize_ticker(code if _cn_market_prefix(ticker) else ticker),
+        price=price,
+        change=change,
+        change_pct=change_pct,
+        name=gq.get("01. symbol", code),
+    )
+
+
 def get_quote(ticker: str) -> Quote:
     """Fetch the latest quote for a single ticker.
 
     Accepts 6-digit codes, exchange-suffixed codes, or Chinese names/
     abbreviations — the latter are auto-resolved via Tencent search.
+
+    Priority for A-shares:
+      1. Tencent qt.gtimg.cn  (free, real-time, most fields)
+      2. Eastmoney push2      (free, real-time, fallback)
+      3. Alpha Vantage        (API key required, cross-border reliable)
     """
     ticker = resolve_ticker(ticker)  # resolve names like '长江电力' → '600900'
     cn_quote = _try_cn_quote_tencent(ticker)
@@ -460,9 +531,11 @@ def get_quote(ticker: str) -> Quote:
     if cn_quote is not None:
         return cn_quote
 
-    # For China A-share codes, do NOT fall back to yfinance unless both
-    # domestic quote sources are unavailable.
+    # Third-party API fallback (works when domestic endpoints are unreachable)
     if _is_cn_ticker(ticker):
+        av_quote = _try_alpha_vantage_quote(ticker)
+        if av_quote is not None:
+            return av_quote
         raise ValueError(
             f"无法从腾讯/东财行情获取 {ticker} 的数据，请检查代码是否正确或稍后重试"
         )
@@ -509,8 +582,17 @@ def get_history(
         DataFrame with Date, Open, High, Low, Close, Volume columns.
     """
     ticker = resolve_ticker(ticker)  # resolve names like '长江电力' → '600900'
+
+    # Serve from Parquet cache when available (daily bars only)
+    if interval == "1d":
+        cached = read_history_cache(ticker, period, interval)
+        if cached is not None:
+            return cached
+
     cn_df = _try_cn_history_tencent(ticker, period=period, interval=interval)
     if cn_df is not None and not cn_df.empty:
+        if interval == "1d":
+            write_history_cache(ticker, period, cn_df, interval)
         return cn_df
 
     if _is_cn_ticker(ticker):
@@ -520,6 +602,8 @@ def get_history(
         df = _yf_history(normalize_ticker(ticker), period=period, interval=interval)
     except Exception:
         return pd.DataFrame()
+    if not df.empty and interval == "1d":
+        write_history_cache(ticker, period, df, interval)
     return df
 
 
@@ -667,78 +751,103 @@ def get_batch_quotes_tencent(codes: list[str]) -> list[Quote]:
     Accepts 6-digit codes like ['600519', '000001']. Returns list of Quote.
     Much faster than calling get_quote() in a loop because Tencent supports
     comma-separated multi-code requests.
+
+    If the batch endpoint is unreachable or only returns a partial result,
+    missing codes fall back to the normal single-quote path so callers do not
+    see an all-or-nothing empty response.
     """
     if not codes:
         return []
 
-    # Build comma-separated symbols
-    symbols: list[str] = []
+    # Build comma-separated symbols and preserve the original code for fallback.
+    requests: list[tuple[str, str]] = []
     for c in codes:
         prefix = _cn_market_prefix(c)
         if prefix:
             raw = c.strip().upper().split(".", maxsplit=1)[0]
-            symbols.append(f"{prefix}{raw}")
+            requests.append((raw, f"{prefix}{raw}"))
 
-    if not symbols:
+    if not requests:
         return []
 
     # Tencent supports up to ~80 codes per request
     results: list[Quote] = []
+    result_codes: set[str] = set()
     batch_size = 60
-    for i in range(0, len(symbols), batch_size):
-        chunk = symbols[i:i + batch_size]
-        url = f"http://qt.gtimg.cn/q={','.join(chunk)}"
+    for i in range(0, len(requests), batch_size):
+        chunk = requests[i:i + batch_size]
+        chunk_codes = [code for code, _ in chunk]
+        chunk_symbols = [symbol for _, symbol in chunk]
+        url = f"http://qt.gtimg.cn/q={','.join(chunk_symbols)}"
         try:
             with urlopen(url, timeout=10) as resp:  # nosec B310
                 text = resp.read().decode("gbk", errors="ignore")
-        except (OSError, URLError):
-            continue
+        except Exception:  # noqa: BLE001 — catch IncompleteRead, URLError, OSError, etc.
+            text = ""
 
-        for line in text.strip().split(";"):
-            line = line.strip()
-            if '"' not in line:
-                continue
-            payload = line.split('"', maxsplit=2)[1]
-            fields = payload.split("~")
-            if len(fields) < 33:
-                continue
+        batch_ok = bool(text)  # False = 整批请求失败（超时/被拦截）
+        if text:
+            for line in text.strip().split(";"):
+                line = line.strip()
+                if '"' not in line:
+                    continue
+                payload = line.split('"', maxsplit=2)[1]
+                fields = payload.split("~")
+                if len(fields) < 33:
+                    continue
 
-            name = fields[1]
-            code = fields[2]
-            last = fields[3]
-            prev_close = fields[4]
+                name = fields[1]
+                code = fields[2]
+                last = fields[3]
+                prev_close = fields[4]
 
-            try:
-                current = float(last)
-                prev = float(prev_close)
-            except ValueError:
-                continue
+                try:
+                    current = float(last)
+                    prev = float(prev_close)
+                except ValueError:
+                    continue
 
-            change = current - prev
-            change_pct = (change / prev * 100) if prev else 0.0
+                change = current - prev
+                change_pct = (change / prev * 100) if prev else 0.0
 
-            turnover: float | None = None
-            volume: float | None = None
-            try:
-                if len(fields) > 37 and fields[37]:
-                    turnover = float(fields[37]) * 10_000
-            except (ValueError, IndexError):
-                pass
-            try:
-                if len(fields) > 36 and fields[36]:
-                    volume = float(fields[36])
-            except (ValueError, IndexError):
-                pass
+                turnover: float | None = None
+                volume: float | None = None
+                try:
+                    if len(fields) > 37 and fields[37]:
+                        turnover = float(fields[37]) * 10_000
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    if len(fields) > 36 and fields[36]:
+                        volume = float(fields[36])
+                except (ValueError, IndexError):
+                    pass
 
-            results.append(Quote(
-                ticker=normalize_ticker(code),
-                price=current,
-                change=change,
-                change_pct=change_pct,
-                name=name,
-                turnover=turnover,
-                volume=volume,
-            ))
+                normalized = normalize_ticker(code)
+                results.append(Quote(
+                    ticker=normalized,
+                    price=current,
+                    change=change,
+                    change_pct=change_pct,
+                    name=name,
+                    turnover=turnover,
+                    volume=volume,
+                ))
+                result_codes.add(normalized.split(".", maxsplit=1)[0])
+
+        missing_codes = [code for code in chunk_codes if code not in result_codes]
+        for code in missing_codes:
+            quote: Quote | None = None
+            if not batch_ok:
+                # 批量腾讯端点已确认失败，直接走东财，避免每支再等 8s Tencent 超时
+                quote = _try_cn_quote_eastmoney(code)
+            if quote is None:
+                try:
+                    quote = get_quote(code)
+                except Exception:
+                    continue
+            results.append(quote)
+            result_codes.add(code)
 
     return results
 
@@ -752,7 +861,7 @@ def fetch_sector_stock_list(sector_code: str = "", limit: int = 50) -> list[Quot
     """
     # Eastmoney list API — fs parameter controls market/sector filtering
     if sector_code:
-        fs = f"b:{sector_code}+f:!50"
+        fs = f"b:{sector_code}"  # BK plate filter; +f:!50 causes empty results for industry plates
     else:
         fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"  # All A-shares
 
@@ -760,9 +869,9 @@ def fetch_sector_stock_list(sector_code: str = "", limit: int = 50) -> list[Quot
         "http://push2.eastmoney.com/api/qt/clist/get?"
         f"pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2&"
         f"fid=f6&fs={fs}&"
-        "fields=f2,f3,f4,f6,f12,f14"
+        "fields=f2,f3,f4,f6,f8,f12,f14"
     )
-    # f2=最新价, f3=涨跌幅%, f4=涨跌额, f6=成交额, f12=代码, f14=名称
+    # f2=最新价, f3=涨跌幅%, f4=涨跌额, f6=成交额, f8=换手率%, f12=代码, f14=名称
 
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -791,6 +900,7 @@ def fetch_sector_stock_list(sector_code: str = "", limit: int = 50) -> list[Quot
             if price == "-" or price is None:
                 continue
 
+            turnover_rate = item.get("f8")
             results.append(Quote(
                 ticker=normalize_ticker(code),
                 price=float(price),
@@ -798,6 +908,7 @@ def fetch_sector_stock_list(sector_code: str = "", limit: int = 50) -> list[Quot
                 change_pct=float(change_pct) if change_pct and change_pct != "-" else 0.0,
                 name=name,
                 turnover=float(turnover) if turnover and turnover != "-" else None,
+                turnover_rate=float(turnover_rate) if turnover_rate and turnover_rate != "-" else None,
             ))
         except (TypeError, ValueError):
             continue
@@ -805,17 +916,69 @@ def fetch_sector_stock_list(sector_code: str = "", limit: int = 50) -> list[Quot
     return results
 
 
-def fetch_sector_list() -> list[dict[str, str]]:
+def fetch_sector_list(limit: int = 100) -> list[dict[str, str]]:
     """Fetch list of A-share sector/industry plates from Eastmoney.
 
     Returns list of dicts with 'code' and 'name' keys.
     """
+    target = max(1, min(limit, 500))
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    page = 1
+
+    while len(results) < target:
+        page_size = min(100, target - len(results))
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get?"
+            f"pn={page}&pz={page_size}&po=1&np=1&fltt=2&invt=2&"
+            "fid=f3&fs=m:90+t:2&"
+            "fields=f12,f14"
+        )
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as resp:  # nosec B310
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except (OSError, URLError, ValueError):
+            break
+
+        diff = data.get("data", {})
+        items = diff.get("diff", []) if diff else []
+        if not items:
+            break
+
+        added = 0
+        for item in items:
+            code = str(item.get("f12", "")).strip()
+            name = str(item.get("f14", "")).strip()
+            if not code or not name or code in seen:
+                continue
+            seen.add(code)
+            results.append({"code": code, "name": name})
+            added += 1
+            if len(results) >= target:
+                break
+
+        if added == 0:
+            break
+        page += 1
+
+    return results
+
+
+def fetch_hot_sectors(limit: int = 5) -> list[dict]:
+    """Fetch top-N hot sector plates ranked by composite heat score.
+
+    Returns list of dicts: {code, name, change_pct, turnover, rise_count, fall_count}
+    sorted by composite heat score (涨幅 × 0.5 + 成交额归一 × 0.5) descending.
+    """
+    fetch_count = max(limit * 4, 40)
     url = (
         "http://push2.eastmoney.com/api/qt/clist/get?"
-        "pn=1&pz=100&po=1&np=1&fltt=2&invt=2&"
+        f"pn=1&pz={fetch_count}&po=1&np=1&fltt=2&invt=2&"
         "fid=f3&fs=m:90+t:2&"
-        "fields=f12,f14"
+        "fields=f12,f14,f3,f6,f104,f105"
     )
+    # f3=涨跌幅%, f6=成交额, f104=上涨家数, f105=下跌家数
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=10) as resp:  # nosec B310
@@ -823,29 +986,149 @@ def fetch_sector_list() -> list[dict[str, str]]:
     except (OSError, URLError, ValueError):
         return []
 
-    diff = data.get("data", {})
-    if not diff:
+    diff = data.get("data") or {}
+    items = diff.get("diff") or []
+
+    sectors: list[dict] = []
+    for item in items:
+        try:
+            code = str(item.get("f12", "")).strip()
+            name = str(item.get("f14", "")).strip()
+            if not code or not name:
+                continue
+            cp = item.get("f3")
+            to = item.get("f6")
+            rise = item.get("f104", 0)
+            fall = item.get("f105", 0)
+            sectors.append({
+                "code": code,
+                "name": name,
+                "change_pct": float(cp) if cp and cp != "-" else 0.0,
+                "turnover": float(to) if to and to != "-" else 0.0,
+                "rise_count": int(rise) if rise else 0,
+                "fall_count": int(fall) if fall else 0,
+            })
+        except (TypeError, ValueError):
+            continue
+
+    if not sectors:
         return []
-    items = diff.get("diff", [])
+
+    max_to = max(s["turnover"] for s in sectors) or 1.0
+    for s in sectors:
+        s["_heat"] = s["change_pct"] * 0.5 + (s["turnover"] / max_to) * 100 * 0.5
+    sectors.sort(key=lambda x: x["_heat"], reverse=True)
 
     return [
-        {"code": str(item.get("f12", "")), "name": str(item.get("f14", ""))}
-        for item in items
-        if item.get("f12") and item.get("f14")
+        {k: v for k, v in s.items() if k != "_heat"}
+        for s in sectors[:limit]
     ]
+
+
+def _fetch_cn_fundamentals(ticker: str) -> dict[str, float | None]:
+    """Fetch fundamental indicators for A-shares from Eastmoney.
+
+    Returns: pe_ratio, profit_margin, return_on_equity, debt_to_equity,
+             revenue_growth_yoy, free_cash_flow, dividend_yield.
+    """
+    _empty: dict[str, float | None] = {
+        "pe_ratio": None, "profit_margin": None, "return_on_equity": None,
+        "debt_to_equity": None, "revenue_growth_yoy": None,
+        "free_cash_flow": None, "dividend_yield": None,
+    }
+    secid = _cn_eastmoney_secid(ticker)
+    if secid is None:
+        return _empty
+
+    code = ticker.strip().upper().split(".", maxsplit=1)[0]
+
+    # Step 1: Get PE, PB, dividend yield from push2 quote API (already reliable)
+    result = dict(_empty)
+    try:
+        url_q = (
+            "http://push2.eastmoney.com/api/qt/stock/get?"
+            "ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields="
+            "f162,f167,f173,f183,f186,f187,f188&secid=" + secid
+        )
+        req = Request(url_q, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        d = data.get("data", {})
+        if d:
+            # f162=PE(TTM), f167=PE(static), f173=ROE(%), f183=profit margin(%),
+            # f186=debt/equity ratio(%), f187=revenue growth YoY(%), f188=dividend yield(%)
+            pe = d.get("f162")
+            if isinstance(pe, (int, float)) and pe != 0 and pe != "-":
+                result["pe_ratio"] = float(pe)
+            roe = d.get("f173")
+            if isinstance(roe, (int, float)) and roe != "-":
+                roe_f = float(roe)
+                # Sanity: ROE outside [-500%, +500%] is a data-feed error
+                if abs(roe_f) <= 500:
+                    result["return_on_equity"] = roe_f / 100.0
+            pm = d.get("f183")
+            if isinstance(pm, (int, float)) and pm != "-":
+                pm_f = float(pm)
+                # Sanity: profit margin outside [-500%, +500%] is a data-feed error
+                if abs(pm_f) <= 500:
+                    result["profit_margin"] = pm_f / 100.0
+            de = d.get("f186")
+            if isinstance(de, (int, float)) and de != "-":
+                de_f = float(de)
+                if abs(de_f) <= 100_000:
+                    result["debt_to_equity"] = de_f / 100.0
+            rg = d.get("f187")
+            if isinstance(rg, (int, float)) and rg != "-":
+                rg_f = float(rg)
+                # Sanity: revenue growth outside [-100%, +5000%] is a data-feed error
+                if -100 <= rg_f <= 5000:
+                    result["revenue_growth_yoy"] = rg_f / 100.0
+            dy = d.get("f188")
+            if isinstance(dy, (int, float)) and dy != "-":
+                dy_f = float(dy)
+                if 0 <= dy_f <= 100:
+                    result["dividend_yield"] = dy_f / 100.0
+    except (OSError, URLError, ValueError, KeyError):
+        pass
+
+    # Step 2: Try to get free cash flow from financial report summary
+    try:
+        market = "SH" if secid.startswith("1.") else "SZ"
+        url_fcf = (
+            f"https://datacenter.eastmoney.com/securities/api/data/get?"
+            f"type=RPT_F10_FINANCE_MAINFINADATA&sty=FREE_CASH_FLOW&"
+            f"filter=(SECUCODE=\"{code}.{market}\")&"
+            f"p=1&ps=1&sr=-1&st=REPORT_DATE"
+        )
+        req = Request(url_fcf, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        items = (data.get("result") or {}).get("data") or []
+        if items and items[0].get("FREE_CASH_FLOW") is not None:
+            result["free_cash_flow"] = float(items[0]["FREE_CASH_FLOW"])
+    except (OSError, URLError, ValueError, KeyError):
+        pass
+
+    return result
 
 
 def get_fundamentals(ticker: str) -> dict[str, float | None]:
     """Fetch basic fundamentals with best-effort fallback.
 
-    Returns keys: pe_ratio, profit_margin, return_on_equity.
+    Returns keys: pe_ratio, profit_margin, return_on_equity,
+    and for A-shares also: debt_to_equity, revenue_growth_yoy,
+    free_cash_flow, dividend_yield.
+
     Missing values are returned as None.
-    For China A-share tickers, skips yfinance entirely to avoid timeouts.
     """
-    _empty = {"pe_ratio": None, "profit_margin": None, "return_on_equity": None}
+    _empty: dict[str, float | None] = {
+        "pe_ratio": None, "profit_margin": None, "return_on_equity": None,
+        "debt_to_equity": None, "revenue_growth_yoy": None,
+        "free_cash_flow": None, "dividend_yield": None,
+    }
 
     if _is_cn_ticker(ticker):
-        return _empty  # yfinance unreliable for A-shares
+        return _fetch_cn_fundamentals(ticker)
 
     normalized = normalize_ticker(ticker)
     try:
@@ -865,4 +1148,233 @@ def get_fundamentals(ticker: str) -> dict[str, float | None]:
         "return_on_equity": (
             float(return_on_equity) if isinstance(return_on_equity, (int, float)) else None
         ),
+        "debt_to_equity": None,
+        "revenue_growth_yoy": None,
+        "free_cash_flow": None,
+        "dividend_yield": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Company profile — industry classification, region, listing info
+# ---------------------------------------------------------------------------
+
+def get_company_profile(ticker: str) -> dict[str, str | int | None]:
+    """Fetch company basic profile for an A-share ticker from Eastmoney.
+
+    Returns keys: industry, region, listing_date, employees, company_type.
+    Falls back to empty strings on failure.
+    """
+    result: dict[str, str | int | None] = {
+        "industry": "",
+        "region": "",
+        "listing_date": "",
+        "employees": None,
+        "company_type": "",
+    }
+    if not _is_cn_ticker(ticker):
+        return result
+
+    secid = _cn_eastmoney_secid(ticker)
+    if secid is None:
+        return result
+
+    code = ticker.strip().upper().split(".", maxsplit=1)[0]
+    market_suffix = "SH" if secid.startswith("1.") else "SZ"
+    secucode = f"{code}.{market_suffix}"
+
+    # Eastmoney F10 company profile API
+    url = (
+        "https://datacenter.eastmoney.com/securities/api/data/v1/get?"
+        "reportName=RPT_F10_INFO_ORGPROFILE&"
+        f"columns=SECURITY_CODE,ORG_NAME,BELONG_INDUSTRY,EM2016,REG_PROVINCE,"
+        f"LISTING_DATE,EMP_NUM,ORG_TYPE&"
+        f"filter=(SECUCODE%3D%22{secucode}%22)"
+    )
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://emweb.securities.eastmoney.com/"})
+        with urlopen(req, timeout=8) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = (data.get("result") or {}).get("data") or []
+        if rows:
+            row = rows[0]
+            result["industry"] = (row.get("EM2016") or row.get("BELONG_INDUSTRY") or "").strip()
+            result["region"] = (row.get("REG_PROVINCE") or "").strip()
+            listing = (row.get("LISTING_DATE") or "").strip()
+            result["listing_date"] = listing[:10] if listing else ""
+            emp = row.get("EMP_NUM")
+            result["employees"] = int(emp) if emp is not None else None
+            result["company_type"] = (row.get("ORG_TYPE") or "").strip()
+    except Exception:
+        pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Recent earnings — last N quarterly / annual reports
+# ---------------------------------------------------------------------------
+
+def get_recent_earnings(ticker: str, n: int = 4) -> list[dict[str, str | float | None]]:
+    """Fetch the most recent N earnings reports for an A-share ticker.
+
+    Returns a list of dicts with keys:
+      period (str), revenue (亿元), net_profit (亿元), eps (元),
+      revenue_yoy (%), profit_yoy (%), report_type (str).
+    """
+    empty: list[dict[str, str | float | None]] = []
+    if not _is_cn_ticker(ticker):
+        return empty
+
+    secid = _cn_eastmoney_secid(ticker)
+    if secid is None:
+        return empty
+
+    code = ticker.strip().upper().split(".", maxsplit=1)[0]
+    market_suffix = "SH" if secid.startswith("1.") else "SZ"
+    secucode = f"{code}.{market_suffix}"
+
+    url = (
+        "https://datacenter.eastmoney.com/securities/api/data/get?"
+        "type=RPT_F10_FINANCE_MAINFINADATA&"
+        "sty=REPORT_DATE,TOTAL_OPERATE_INCOME,NET_PROFIT_MOTHER,"
+        "BASIC_EPS,YSTZ,SJLTZ,NOTICE_DATE&"
+        f"filter=(SECUCODE%3D%22{secucode}%22)&"
+        f"p=1&ps={n}&sr=-1&st=REPORT_DATE"
+    )
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = (data.get("result") or {}).get("data") or []
+    except Exception:
+        return empty
+
+    records: list[dict[str, str | float | None]] = []
+    for row in rows[:n]:
+        report_date = (row.get("REPORT_DATE") or "")[:10]
+        # Determine report type from date
+        if report_date.endswith("-12-31"):
+            rtype = "年报"
+        elif report_date.endswith("-09-30"):
+            rtype = "三季报"
+        elif report_date.endswith("-06-30"):
+            rtype = "中报"
+        elif report_date.endswith("-03-31"):
+            rtype = "一季报"
+        else:
+            rtype = "报告期"
+
+        def _f(v: object) -> float | None:
+            try:
+                return float(v) if v is not None and v != "-" else None  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+
+        revenue_raw = _f(row.get("TOTAL_OPERATE_INCOME"))
+        profit_raw = _f(row.get("NET_PROFIT_MOTHER"))
+        records.append({
+            "period": report_date,
+            "report_type": rtype,
+            "revenue": round(revenue_raw / 1e8, 2) if revenue_raw is not None else None,
+            "net_profit": round(profit_raw / 1e8, 2) if profit_raw is not None else None,
+            "eps": _f(row.get("BASIC_EPS")),
+            "revenue_yoy": _f(row.get("YSTZ")),   # 营收同比增长(%)
+            "profit_yoy": _f(row.get("SJLTZ")),    # 净利同比增长(%)
+        })
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Full stock profile — combined data for the StockDetail company info panel
+# ---------------------------------------------------------------------------
+
+def get_full_stock_profile(ticker: str) -> dict:
+    """Return a combined company profile dict for the StockDetail UI panel.
+
+    Merges: quote (name, pe_ttm, pb_ratio, market_cap), company profile
+    (industry, region, listing_date, employees), fundamentals (profit_margin,
+    roe, revenue_growth), and recent earnings (last 4 quarters).
+    """
+    ticker = resolve_ticker(ticker)
+
+    result: dict = {
+        "ticker": ticker,
+        "name": ticker,
+        "main_business": "",
+        "industry": "",
+        "region": "",
+        "listing_date": "",
+        "employees": None,
+        "pe_ttm": None,
+        "pb_ratio": None,
+        "market_cap_total": None,
+        "profit_margin": None,
+        "revenue_growth_yoy": None,
+        "return_on_equity": None,
+        "dividend_yield": None,
+        "recent_earnings": [],
+    }
+
+    # 1. Quote — name, pe_ttm, pb_ratio, market_cap_total
+    try:
+        q = get_quote(ticker)
+        result["name"] = q.name or ticker
+        result["pe_ttm"] = q.pe_ttm
+        result["pb_ratio"] = q.pb_ratio
+        result["market_cap_total"] = q.market_cap_total
+    except Exception:
+        pass
+
+    # 2. Company profile — industry, region, listing_date, employees
+    try:
+        prof = get_company_profile(ticker)
+        result["industry"] = prof.get("industry") or ""
+        result["region"] = prof.get("region") or ""
+        result["listing_date"] = prof.get("listing_date") or ""
+        result["employees"] = prof.get("employees")
+    except Exception:
+        pass
+
+    # 3. Main business description — Eastmoney F10 ORG basic info
+    try:
+        secid = _cn_eastmoney_secid(ticker)
+        if secid:
+            code = ticker.strip().upper().split(".", maxsplit=1)[0]
+            market_suffix = "SH" if secid.startswith("1.") else "SZ"
+            secucode = f"{code}.{market_suffix}"
+            url_biz = (
+                "https://datacenter.eastmoney.com/securities/api/data/get?"
+                "type=RPT_F10_ORG_ORGPROFILE&"
+                "sty=MAIN_BUSINESS&"
+                f'filter=(SECUCODE="{secucode}")&p=1&ps=1'
+            )
+            req = Request(url_biz, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=8) as resp:  # nosec B310
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            rows = (data.get("result") or {}).get("data") or []
+            if rows and rows[0].get("MAIN_BUSINESS"):
+                mb = str(rows[0]["MAIN_BUSINESS"]).strip()
+                result["main_business"] = mb[:300] if mb else ""
+    except Exception:
+        pass
+
+    # 4. Fundamentals — profit_margin, roe, revenue_growth, dividend_yield
+    try:
+        fundas = get_fundamentals(ticker)
+        result["profit_margin"] = fundas.get("profit_margin")
+        result["revenue_growth_yoy"] = fundas.get("revenue_growth_yoy")
+        result["return_on_equity"] = fundas.get("return_on_equity")
+        result["dividend_yield"] = fundas.get("dividend_yield")
+    except Exception:
+        pass
+
+    # 5. Recent earnings (last 4 quarters / annual reports)
+    try:
+        result["recent_earnings"] = get_recent_earnings(ticker, n=4)
+    except Exception:
+        pass
+
+    return result
+

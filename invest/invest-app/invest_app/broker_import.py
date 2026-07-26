@@ -8,8 +8,9 @@ Supported sources:
   - 同花顺 (THS / iFinD)
   - 支付宝基金 (Alipay Funds)
   - 天天基金 (Tian Tian Fund)
-  - 通用CSV (Generic)
-  - 手动JSON (Manual batch)
+  - 通用CSV (Generic, with header row)
+  - 快速粘贴 (Headerless CSV: 代码,名称,数量,成本价)
+  - 手动JSON (Manual batch JSON)
 """
 
 from __future__ import annotations
@@ -244,6 +245,88 @@ def _parse_csv_generic(
 # Broker-specific parsers
 # ---------------------------------------------------------------------------
 
+def parse_simple_csv(text: str, broker_label: str = "快速粘贴") -> ImportResult:
+    """快速粘贴 — headerless positional CSV, one holding per line.
+
+    Accepted formats (per line):
+      代码,名称,数量,成本价      e.g.  000630,铜陵有色,1300,6.795
+      代码,数量,成本价           e.g.  600519,100,1800.00
+      代码,数量                  e.g.  600519,100
+    Lines starting with # or // are treated as comments.
+    Lines that look like header rows (contain Chinese column keywords) are skipped.
+    """
+    result = ImportResult(broker=broker_label)
+
+    def _is_number(s: str) -> bool:
+        try:
+            float(re.sub(r"[,%¥$\s]", "", s.strip()))
+            return True
+        except ValueError:
+            return False
+
+    _HEADER_KEYWORDS = {"证券代码", "股票代码", "代码", "ticker", "symbol", "code"}
+
+    for line_num, raw_line in enumerate(text.strip().splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        # Skip header-like rows
+        first_token = line.split(",")[0].strip().lower().replace(" ", "")
+        if first_token in {k.lower() for k in _HEADER_KEYWORDS}:
+            continue
+
+        parts = [p.strip() for p in line.split(",")]
+        result.raw_rows += 1
+        try:
+            if len(parts) < 2:
+                result.errors.append(f"第{line_num}行: 字段不足（至少需要 代码,数量）")
+                continue
+
+            code = parts[0]
+            if not code:
+                continue
+
+            # Skip summary rows
+            if any(kw in code for kw in ["合计", "总计", "小计"]):
+                continue
+
+            # Distinguish layout by whether parts[1] is numeric
+            if _is_number(parts[1]):
+                # Format: 代码, 数量[, 成本价]
+                name = ""
+                shares_str = parts[1]
+                cost_str = parts[2] if len(parts) >= 3 else "0"
+            else:
+                # Format: 代码, 名称, 数量[, 成本价]
+                name = parts[1]
+                if len(parts) < 3:
+                    result.errors.append(f"第{line_num}行: 缺少数量字段")
+                    continue
+                shares_str = parts[2]
+                cost_str = parts[3] if len(parts) >= 4 else "0"
+
+            shares = _safe_float(shares_str)
+            cost = _safe_float(cost_str)
+
+            if shares <= 0:
+                result.errors.append(f"第{line_num}行: 数量 {shares_str!r} 无效，跳过")
+                continue
+
+            ticker = normalise_ticker(code, AssetType.STOCK)
+            result.holdings.append(ImportedHolding(
+                ticker=ticker,
+                name=name,
+                shares=shares,
+                cost_price=cost,
+                asset_type=AssetType.STOCK,
+                broker=broker_label,
+            ))
+        except Exception as e:
+            result.errors.append(f"第{line_num}行解析失败: {e}")
+
+    return result
+
+
 def parse_zhaoshang(text: str) -> ImportResult:
     """招商证券 — 智远一户通导出的持仓CSV。"""
     return _parse_csv_generic(text, broker_label="招商证券")
@@ -285,15 +368,27 @@ def parse_generic_csv(text: str) -> ImportResult:
 
 
 def parse_manual_json(text: str) -> ImportResult:
-    """手动JSON批量导入。
+    """手动JSON批量导入。自动识别 JSON 数组和简单 CSV 两种格式。
 
-    Expected format:
+    JSON format:
     [
       {"ticker": "600519", "shares": 100, "cost_price": 1500.0},
       {"ticker": "000858", "shares": 200, "cost_price": 150.0, "name": "五粮液"},
       ...
     ]
+
+    Simple CSV format (headerless):
+      000630,铜陵有色,1300,6.795
+      600519,贵州茅台,100,1800
     """
+    text = text.strip()
+    # Auto-detect: if not starting with [ or {, try simple CSV first
+    if not text.startswith("[") and not text.startswith("{"):
+        r = parse_simple_csv(text, broker_label="手动输入")
+        if r.holdings or not text:
+            return r
+        # Fall through to give a better JSON error message below
+
     result = ImportResult(broker="手动输入")
     try:
         data = json.loads(text)
@@ -349,6 +444,7 @@ BROKER_PARSERS = {
     "alipay_fund": parse_alipay_fund,
     "tiantian_fund": parse_tiantian_fund,
     "generic_csv": parse_generic_csv,
+    "quick_paste": parse_simple_csv,
     "manual_json": parse_manual_json,
 }
 
@@ -359,14 +455,15 @@ BROKER_INFO = [
         "icon": "🏦",
         "type": "stock",
         "format": "CSV",
-        "instructions": "打开招商证券「智远一户通」APP → 持仓 → 右上角 ⋯ → 导出持仓 → 选择CSV格式 → 发送到电脑",
+        "instructions": "招商证券 APP 目前不支持一键导出全部持仓。\n推荐方式：\n① 进入 APP「持仓」页面，逐行记录股票代码、数量和成本价；\n② 使用下方「快速粘贴」功能，按 代码,名称,数量,成本价 格式批量录入。\n若您使用 PC 端「智远一户通」，可尝试导出 CSV 后在此上传。",
     },
     {
         "id": "tencent",
         "name": "腾讯微证券",
         "icon": "💬",
         "type": "stock",
-        "instructions": "微信 → 我 → 服务 → 理财通 → 股票 → 持仓 → 导出持仓明细",
+        "format": "CSV",
+        "instructions": "腾讯微证券 / 微信理财通目前不提供持仓导出功能。\n推荐方式：\n① 在「持仓」页查看各股票代码、持仓数量和成本价；\n② 使用下方「快速粘贴」功能，按 代码,名称,数量,成本价 格式批量录入。\n示例：000630,铜陵有色,1300,6.795",
     },
     {
         "id": "changjiang",
@@ -409,20 +506,28 @@ BROKER_INFO = [
         "instructions": "打开「天天基金」APP → 我的持仓 → 导出 → CSV格式",
     },
     {
+        "id": "quick_paste",
+        "name": "快速粘贴",
+        "icon": "⚡",
+        "type": "any",
+        "format": "CSV",
+        "instructions": "每行一条持仓记录，支持以下格式（无需表头）：\n代码,名称,数量,成本价\n代码,数量,成本价\n代码,数量\n\n示例：\n000630,铜陵有色,1300,6.795\n600519,贵州茅台,100,1800\n159915,创业板ETF,5000,1.23",
+    },
+    {
         "id": "generic_csv",
         "name": "通用CSV",
         "icon": "📄",
         "type": "any",
         "format": "CSV",
-        "instructions": "CSV文件需包含以下列（表头名灵活匹配）：证券代码、名称（可选）、持仓数量、成本价",
+        "instructions": "CSV文件需包含表头行，列名自动匹配：\n证券代码 / 名称（可选）/ 持仓数量 / 成本价\n\n示例：\n证券代码,证券名称,持仓数量,成本价\n600519,贵州茅台,100,1455.02",
     },
     {
         "id": "manual_json",
         "name": "手动批量输入",
         "icon": "✏️",
         "type": "any",
-        "format": "JSON",
-        "instructions": '格式示例：[{"ticker":"600519","shares":100,"cost_price":1500},{"ticker":"000858","shares":200,"cost_price":150,"name":"五粮液"}]',
+        "format": "JSON/CSV",
+        "instructions": '支持 JSON 数组格式：\n[{"ticker":"600519","shares":100,"cost_price":1500},{"ticker":"000858","shares":200,"cost_price":150,"name":"五粮液"}]\n\n也支持无表头 CSV 格式：\n000630,铜陵有色,1300,6.795\n600519,贵州茅台,100,1800',
     },
 ]
 

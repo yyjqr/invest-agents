@@ -38,7 +38,17 @@ from invest_app.models import Holding, Portfolio, TransactionType
 from invest_app.portfolio import load_portfolio
 from invest_app.strategies import _calc_bias, _calc_rsi
 
-ForecastHorizon = Literal["1h", "1d"]
+ForecastHorizon = Literal["1h", "1d", "1w", "1m", "3m"]
+
+
+@dataclass
+class ForecastScenario:
+    """One scenario in a probabilistic forecast."""
+    label: str            # "乐观" | "基准" | "悲观"
+    probability: float    # e.g. 0.25
+    predicted_price: float
+    expected_return_pct: float
+    description: str      # human-readable short note
 
 
 @dataclass
@@ -65,6 +75,14 @@ class ShortTermForecast:
     profit_margin: float | None = None
     factors: list[str] = field(default_factory=list)
     model_scores: dict[str, float] = field(default_factory=dict)
+    scenarios: list[ForecastScenario] = field(default_factory=list)
+    news_sentiment: str = ""          # "偏多" | "偏空" | "中性" | ""
+    news_sentiment_score: float = 0.0  # 0-100 raw score from qveris analysis
+    # Quantile price bands — derived from range_sigma (80% and 50% CI)
+    quantile_10: float | None = None   # 10th pct price (80% CI lower)
+    quantile_25: float | None = None   # 25th pct price (50% CI lower)
+    quantile_75: float | None = None   # 75th pct price (50% CI upper)
+    quantile_90: float | None = None   # 90th pct price (80% CI upper)
 
 
 def _clip(value: float, lower: float, upper: float) -> float:
@@ -655,6 +673,14 @@ def _time_windows(
     trend: str,
     anchor_time: pd.Timestamp | None,
 ) -> tuple[str, str]:
+    if horizon in ("1w", "1m", "3m"):
+        # For weekly/monthly horizons, return approximate window descriptions
+        if trend in {"上涨偏多", "震荡偏强"}:
+            return "周期末段", "周期前段"
+        if trend in {"下跌偏空", "震荡偏弱"}:
+            return "周期前段", "周期末段"
+        return "周期中段", "周期中段"
+
     if horizon == "1d":
         if trend in {"上涨偏多", "震荡偏强"}:
             return "14:10-15:00", "10:00-10:40"
@@ -675,6 +701,116 @@ def _time_windows(
     return high_dt.strftime("%H:%M"), low_dt.strftime("%H:%M")
 
 
+def _news_sentiment_score(
+    sentiment: str, score: float,
+) -> tuple[float, str | None]:
+    """Convert news sentiment + score into a forecast factor.
+
+    Bloomberg-style: news sentiment acts as a momentum amplifier/dampener.
+    sentiment: "偏多" | "偏空" | "中性"
+    score: 0-100 (50 = neutral)
+    Returns (factor_score in [-1, 1], detail_text).
+    """
+    if not sentiment:
+        return 0.0, None
+
+    # Normalize score: 50 → 0, 100 → +1, 0 → -1
+    normalized = _clip((score - 50) / 50, -1.0, 1.0)
+
+    if sentiment == "偏多":
+        factor = _clip(0.15 + normalized * 0.45, 0.0, 0.7)
+        detail = f"资讯情绪偏多（得分 {score:.0f}/100），正面信号较强"
+    elif sentiment == "偏空":
+        factor = _clip(-0.15 + normalized * 0.45, -0.7, 0.0)
+        detail = f"资讯情绪偏空（得分 {score:.0f}/100），负面信号需警惕"
+    else:
+        factor = _clip(normalized * 0.2, -0.3, 0.3)
+        detail = f"资讯情绪中性（得分 {score:.0f}/100）"
+
+    return round(factor, 4), detail
+
+
+def _build_scenarios(
+    current: float,
+    signal: float,
+    range_sigma: float,
+    confidence: float,
+    trend: str,
+    support: float | None,
+    resistance: float | None,
+) -> list[ForecastScenario]:
+    """Build 3-scenario probabilistic forecast (optimistic / base / pessimistic).
+
+    Inspired by BlackRock Aladdin's scenario analysis:
+    - Optimistic (25%): signal + 1 sigma upside
+    - Base (50%): signal-based prediction
+    - Pessimistic (25%): signal - 1 sigma downside
+    """
+    base_return = _clip(signal * range_sigma * 1.25, -0.08, 0.08)
+    base_price = current * (1 + base_return)
+
+    # Optimistic: stronger move in signal direction, capped by resistance
+    opt_return = base_return + range_sigma * 0.85
+    opt_price = current * (1 + opt_return)
+    if resistance and opt_price > resistance * 1.02:
+        opt_price = resistance * 1.01
+        opt_return = (opt_price / current - 1) if current > 0 else opt_return
+
+    # Pessimistic: adverse move, floored by support
+    pes_return = base_return - range_sigma * 0.85
+    pes_price = current * (1 + pes_return)
+    if support and pes_price < support * 0.98:
+        pes_price = support * 0.99
+        pes_return = (pes_price / current - 1) if current > 0 else pes_return
+
+    # Probability adjustment: when signal is strong, shift probability
+    if abs(signal) > 0.3:
+        if signal > 0:
+            opt_prob, base_prob, pes_prob = 0.35, 0.45, 0.20
+        else:
+            opt_prob, base_prob, pes_prob = 0.20, 0.45, 0.35
+    else:
+        opt_prob, base_prob, pes_prob = 0.25, 0.50, 0.25
+
+    # Build descriptions
+    if trend in ("上涨偏多", "震荡偏强"):
+        opt_desc = "多因子共振向上，突破关键阻力位可能性较大"
+        base_desc = "延续当前偏强趋势，波动区间内运行"
+        pes_desc = "上升动能衰减或外部冲击导致短期调整"
+    elif trend in ("下跌偏空", "震荡偏弱"):
+        opt_desc = "超跌反弹或利好催化带动技术修复"
+        base_desc = "延续当前偏弱走势，寻底过程"
+        pes_desc = "负面因素叠加，加速下跌风险"
+    else:
+        opt_desc = "突破盘整区间上沿，资金推动上行"
+        base_desc = "维持窄幅震荡，等待方向选择"
+        pes_desc = "跌破盘整下沿，进入调整通道"
+
+    return [
+        ForecastScenario(
+            label="乐观",
+            probability=round(opt_prob, 2),
+            predicted_price=round(opt_price, 4),
+            expected_return_pct=round(opt_return * 100, 2),
+            description=opt_desc,
+        ),
+        ForecastScenario(
+            label="基准",
+            probability=round(base_prob, 2),
+            predicted_price=round(base_price, 4),
+            expected_return_pct=round(base_return * 100, 2),
+            description=base_desc,
+        ),
+        ForecastScenario(
+            label="悲观",
+            probability=round(pes_prob, 2),
+            predicted_price=round(pes_price, 4),
+            expected_return_pct=round(pes_return * 100, 2),
+            description=pes_desc,
+        ),
+    ]
+
+
 def build_short_term_forecast(
     *,
     ticker: str,
@@ -688,6 +824,8 @@ def build_short_term_forecast(
     profit_margin: float | None = None,
     holding: Holding | None = None,
     is_fund: bool = False,
+    news_sentiment: str = "",
+    news_sentiment_score: float = 0.0,
 ) -> ShortTermForecast:
     """Build a short-term forecast from already loaded market data.
 
@@ -830,6 +968,9 @@ def build_short_term_forecast(
 
     tx_score, tx_detail = _transaction_signal(holding, current)
 
+    # --- NEW: News sentiment factor ---
+    news_s, news_detail = _news_sentiment_score(news_sentiment, news_sentiment_score)
+
     # --- Intraday micro-trend (1h only) ---
     intra_score = 0.0
     sigma_hour = None
@@ -841,33 +982,25 @@ def build_short_term_forecast(
         )
 
     # ===================================================================
-    # Weighted ensemble — rebalanced for 14 factors
+    # Weighted ensemble — rebalanced for 15 factors
     # ===================================================================
     if horizon == "1h":
-        # 1h weights (total = 1.00):
-        #   intraday_micro  0.22   |  mom_short     0.10
-        #   intra_flow      0.10   |  mean_rev      0.08
-        #   macd            0.10   |  bollinger     0.08
-        #   kdj             0.06   |  rsi           0.06
-        #   obv_div         0.05   |  vpd           0.04
-        #   mfi             0.04   |  volume_ratio  0.03
-        #   pe              0.02   |  profit        0.01
-        #   tx              0.01
         signal = (
-            intra_score * 0.22
-            + intra_flow_score * 0.10
-            + mom_short * 0.10
-            + mean_rev * 0.08
-            + macd_s * 0.10
-            + boll_s * 0.08
+            intra_score * 0.20
+            + intra_flow_score * 0.09
+            + mom_short * 0.09
+            + mean_rev * 0.07
+            + macd_s * 0.09
+            + boll_s * 0.07
             + kdj_s * 0.06
             + rsi_score * 0.06
+            + news_s * 0.06
             + obv_score * 0.05
             + vpd_score * 0.04
             + mfi_s * 0.04
             + volume_score * 0.03
             + pe_score * 0.02
-            + profit_score * 0.01
+            + profit_score * 0.02
             + tx_score * 0.01
         )
         range_sigma = max(
@@ -878,24 +1011,17 @@ def build_short_term_forecast(
         )
         expected_return_pct = _clip(signal * range_sigma * 1.45, -0.030, 0.030)
         expected_range_pct = _clip(range_sigma * 1.60, 0.004, 0.050)
-    else:
-        # 1d weights (total = 1.00):
-        #   mom_short       0.14   |  mom_mid       0.10
-        #   macd            0.14   |  mean_rev      0.10
-        #   obv_div         0.08   |  bollinger     0.08
-        #   mfi             0.08   |  kdj           0.07
-        #   vpd             0.05   |  rsi           0.05
-        #   volume_ratio    0.04   |  pe            0.03
-        #   profit          0.02   |  tx            0.02
+    elif horizon == "1d":
         signal = (
-            mom_short * 0.14
-            + mom_mid * 0.10
-            + macd_s * 0.14
-            + mean_rev * 0.10
-            + obv_score * 0.08
-            + boll_s * 0.08
-            + mfi_s * 0.08
-            + kdj_s * 0.07
+            mom_short * 0.12
+            + mom_mid * 0.09
+            + macd_s * 0.12
+            + mean_rev * 0.09
+            + news_s * 0.08
+            + obv_score * 0.07
+            + boll_s * 0.07
+            + mfi_s * 0.07
+            + kdj_s * 0.06
             + vpd_score * 0.05
             + rsi_score * 0.05
             + volume_score * 0.04
@@ -912,6 +1038,90 @@ def build_short_term_forecast(
             signal * range_sigma * 1.25, -0.080, 0.080,
         )
         expected_range_pct = _clip(range_sigma * 2.10, 0.008, 0.120)
+    elif horizon == "1w":
+        # 1w: shift toward mid-term momentum + fundamental factors
+        signal = (
+            mom_mid * 0.14
+            + mom_short * 0.08
+            + macd_s * 0.12
+            + mean_rev * 0.10
+            + news_s * 0.09
+            + obv_score * 0.08
+            + boll_s * 0.06
+            + mfi_s * 0.07
+            + kdj_s * 0.05
+            + vpd_score * 0.04
+            + rsi_score * 0.04
+            + volume_score * 0.03
+            + pe_score * 0.05
+            + profit_score * 0.03
+            + tx_score * 0.02
+        )
+        range_sigma = max(
+            sigma_daily * np.sqrt(5),
+            ((atr / current) if atr is not None and current > 0 else 0.0) * 1.2,
+            0.012,
+        )
+        expected_return_pct = _clip(
+            signal * range_sigma * 0.90, -0.15, 0.15,
+        )
+        expected_range_pct = _clip(range_sigma * 1.80, 0.02, 0.25)
+    elif horizon == "1m":
+        # 1m: fundamental + macro weight increases
+        signal = (
+            mom_mid * 0.12
+            + macd_s * 0.10
+            + mean_rev * 0.12
+            + news_s * 0.10
+            + obv_score * 0.08
+            + boll_s * 0.06
+            + mfi_s * 0.06
+            + pe_score * 0.10
+            + profit_score * 0.06
+            + mom_short * 0.05
+            + kdj_s * 0.04
+            + rsi_score * 0.04
+            + vpd_score * 0.03
+            + volume_score * 0.02
+            + tx_score * 0.02
+        )
+        range_sigma = max(
+            sigma_daily * np.sqrt(22),
+            ((atr / current) if atr is not None and current > 0 else 0.0) * 2.5,
+            0.03,
+        )
+        expected_return_pct = _clip(
+            signal * range_sigma * 0.65, -0.25, 0.25,
+        )
+        expected_range_pct = _clip(range_sigma * 1.60, 0.05, 0.40)
+    else:
+        # 3m: long-term fundamental-dominant
+        signal = (
+            pe_score * 0.15
+            + profit_score * 0.10
+            + mean_rev * 0.13
+            + mom_mid * 0.10
+            + news_s * 0.10
+            + macd_s * 0.08
+            + obv_score * 0.07
+            + boll_s * 0.05
+            + mfi_s * 0.05
+            + rsi_score * 0.04
+            + mom_short * 0.03
+            + kdj_s * 0.03
+            + vpd_score * 0.03
+            + volume_score * 0.02
+            + tx_score * 0.02
+        )
+        range_sigma = max(
+            sigma_daily * np.sqrt(66),
+            ((atr / current) if atr is not None and current > 0 else 0.0) * 4.5,
+            0.06,
+        )
+        expected_return_pct = _clip(
+            signal * range_sigma * 0.45, -0.40, 0.40,
+        )
+        expected_range_pct = _clip(range_sigma * 1.40, 0.08, 0.60)
 
     predicted_price = current * (1 + expected_return_pct)
 
@@ -935,7 +1145,7 @@ def build_short_term_forecast(
     # Confidence: boost when more factors agree
     factor_agreement = sum(
         1 for s in [
-            mom_short, macd_s, boll_s, kdj_s, obv_score, mfi_s, rsi_score,
+            mom_short, macd_s, boll_s, kdj_s, obv_score, mfi_s, rsi_score, news_s,
         ] if (s > 0.1) == (signal > 0)
     )
     confidence = _clip(
@@ -943,9 +1153,23 @@ def build_short_term_forecast(
         + abs(signal) * 26
         + min(len(close), 126) / 126 * 8
         + factor_agreement * 2.5
-        + (5 if horizon == "1h" and sigma_hour is not None else 0),
+        + (5 if horizon == "1h" and sigma_hour is not None else 0)
+        + (3 if news_sentiment else 0),  # bonus for having news context
         38,
         92,
+    )
+
+    # ===================================================================
+    # Build 3-scenario probabilistic forecast
+    # ===================================================================
+    scenarios = _build_scenarios(
+        current=current,
+        signal=signal,
+        range_sigma=range_sigma,
+        confidence=confidence,
+        trend=_label_trend(signal),
+        support=support,
+        resistance=resistance,
     )
 
     # ===================================================================
@@ -993,6 +1217,8 @@ def build_short_term_forecast(
         elif vol_ratio <= 0.8:
             factors.append(f"量比约 {vol_ratio:.2f}x，量能一般")
 
+    if news_detail:
+        factors.append(news_detail)
     if intraday_detail and horizon == "1h":
         factors.append(intraday_detail)
     if intra_flow_detail and horizon == "1h":
@@ -1021,10 +1247,23 @@ def build_short_term_forecast(
         "pe_score": round(pe_score, 4),
         "profit_score": round(profit_score, 4),
         "transaction_score": round(tx_score, 4),
+        "news_sentiment": round(news_s, 4),
     }
     if horizon == "1h":
         model_scores["intraday_score"] = round(intra_score, 4)
         model_scores["intraday_flow"] = round(intra_flow_score, 4)
+
+    # ===================================================================
+    # Quantile price bands (80% and 50% confidence intervals)
+    # z10 = norm.ppf(0.90) ≈ 1.2816,  z25 = norm.ppf(0.75) ≈ 0.6745
+    # ===================================================================
+    _Z90 = 1.2816
+    _Z75 = 0.6745
+    _q_scale = range_sigma * 0.7  # empirical scaling to match scenario spreads
+    q_10 = max(predicted_price * (1 - _Z90 * _q_scale), current * 0.4)
+    q_25 = predicted_price * (1 - _Z75 * _q_scale)
+    q_75 = predicted_price * (1 + _Z75 * _q_scale)
+    q_90 = min(predicted_price * (1 + _Z90 * _q_scale), current * 2.5)
 
     return ShortTermForecast(
         ticker=ticker,
@@ -1036,7 +1275,7 @@ def build_short_term_forecast(
         predicted_high=round(predicted_high, 4),
         predicted_low=round(predicted_low, 4),
         trend=trend,
-        confidence=round(confidence, 1),
+        confidence=round(confidence / 100, 3),
         expected_return_pct=round(expected_return_pct * 100, 2),
         expected_range_pct=round(expected_range_pct * 100, 2),
         high_time=high_time,
@@ -1047,16 +1286,27 @@ def build_short_term_forecast(
         profit_margin=profit_margin,
         factors=factors[:10],
         model_scores=model_scores,
+        scenarios=scenarios,
+        news_sentiment=news_sentiment,
+        news_sentiment_score=news_sentiment_score,
+        quantile_10=round(q_10, 4),
+        quantile_25=round(q_25, 4),
+        quantile_75=round(q_75, 4),
+        quantile_90=round(q_90, 4),
     )
 
 
 def forecast_ticker(
     ticker: str,
     horizon: ForecastHorizon = "1d",
-    history_period: str = "6mo",
+    history_period: str = "",
     portfolio: Portfolio | None = None,
 ) -> ShortTermForecast:
     """Fetch market data and produce one short-term forecast."""
+    # Auto-select history period based on horizon if not explicitly set
+    if not history_period:
+        history_period = {"1h": "6mo", "1d": "6mo", "1w": "1y", "1m": "2y", "3m": "2y"}.get(horizon, "6mo")
+
     resolved = resolve_ticker(ticker)
     quote = get_quote(resolved)
     history = get_history(resolved, period=history_period, interval="1d")

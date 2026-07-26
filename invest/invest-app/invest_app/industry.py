@@ -6,40 +6,111 @@ and SWOT-style analytical framework output.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-from invest_app.market_data import _classify_cn_code, get_history, get_quote, normalize_ticker
+from invest_app.market_data import (
+    _classify_cn_code, get_history, get_quote, normalize_ticker,
+    get_batch_quotes_tencent, fetch_sector_list, fetch_sector_stock_list,
+)
+
+import json
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Sector / industry mapping
 # ---------------------------------------------------------------------------
 
-# Map A-share codes or name keywords → sector tag
+# Map A-share names/keywords → 申万一级行业 (Shenwan Level 1, 2021 revision)
 _SECTOR_KEYWORDS: dict[str, list[str]] = {
-    "科技": ["科技", "信息", "软件", "互联", "通信", "电子", "计算机", "数字", "云"],
-    "芯片/半导体": ["芯片", "半导体", "集成电路", "IC", "晶圆", "封测", "光刻"],
-    "AI/人工智能": ["AI", "人工智能", "机器学习", "大模型", "智能", "算力", "GPU"],
-    "电力/能源": ["电力", "能源", "电网", "核电", "光伏", "风电", "水电", "储能", "新能源"],
-    "有色金属": ["有色", "铜", "铝", "锂", "钴", "镍", "稀土", "黄金", "白银", "矿"],
-    "消费": ["消费", "白酒", "食品", "饮料", "零售", "家电", "医药", "茅台"],
-    "金融": ["银行", "保险", "券商", "证券", "金融"],
-    "地产": ["地产", "房产", "物业"],
+    "电子":     ["芯片", "半导体", "集成电路", "IC", "晶圆", "封测", "光刻",
+                  "传感器", "元器件", "CMOS", "面板", "LED", "射频", "电子"],
+    "计算机":   ["软件", "信息技术", "互联网", "云计算", "AI", "人工智能",
+                  "大模型", "算力", "GPU", "网络安全", "SaaS", "数字化",
+                  "计算机", "金融IT"],
+    "通信":     ["通信", "电信", "5G", "光通信", "卫星", "基站", "运营商"],
+    "传媒":     ["传媒", "媒体", "游戏", "影视", "广告", "出版", "新闻"],
+    "电力设备": ["光伏", "风电", "储能", "锂电", "动力电池", "逆变器",
+                  "充电桩", "特高压", "电力设备", "新能源设备"],
+    "公用事业": ["电力", "水电", "核电", "燃气", "供热", "公用事业"],
+    "汽车":     ["汽车", "整车", "客车", "卡车", "新能源车", "电动车",
+                  "汽车零部件", "自动驾驶", "智能网联"],
+    "机械设备": ["机械", "机器人", "自动化", "工控", "减速器", "液压",
+                  "精密零件", "激光设备", "数控", "工程机械"],
+    "国防军工": ["军工", "航空", "航天", "国防", "导弹", "雷达", "飞机",
+                  "舰船", "兵器"],
+    "医药生物": ["医药", "生物", "制药", "医疗器械", "CRO", "CDMO",
+                  "疫苗", "中药", "基因", "医院", "眼科", "骨科"],
+    "食品饮料": ["白酒", "啤酒", "乳制品", "调味品", "食品", "饮料",
+                  "休闲零食", "茅台", "五粮液"],
+    "家用电器": ["家电", "空调", "冰箱", "洗衣机", "小家电", "白色家电"],
+    "纺织服饰": ["纺织", "服装", "服饰", "面料", "品牌服饰"],
+    "轻工制造": ["造纸", "包装", "家具", "文具", "印刷", "家居用品"],
+    "商贸零售": ["零售", "百货", "超市", "商贸", "连锁"],
+    "社会服务": ["酒店", "旅游", "景区", "教育", "培训", "餐饮", "免税"],
+    "银行":     ["银行", "储蓄", "农行", "工行", "建行", "中行", "招行", "邮储"],
+    "非银金融": ["证券", "保险", "券商", "基金", "信托", "期货", "金融"],
+    "有色金属": ["有色", "铜", "铝", "锂", "钴", "镍", "稀土", "黄金",
+                  "白银", "矿业", "钼"],
+    "基础化工": ["化工", "化学", "化纤", "农药", "化肥", "染料", "橡胶",
+                  "塑料", "涂料", "MDI"],
+    "钢铁":     ["钢铁", "钢材", "钢板", "钢管", "冶钢", "特钢", "铁合金"],
+    "煤炭":     ["煤炭", "煤矿", "焦煤", "动力煤", "焦炭"],
+    "石油石化": ["石油", "石化", "炼化", "原油", "天然气", "炼油", "海油"],
+    "房地产":   ["地产", "房地产", "房产", "物业", "住宅", "置业"],
+    "建筑材料": ["水泥", "玻璃", "石材", "砖瓦", "防水", "建材"],
+    "建筑装饰": ["建筑", "建设", "施工", "装饰", "装修", "工程", "园林",
+                  "中铁", "中建"],
+    "交通运输": ["交通", "运输", "航运", "铁路", "高铁", "公路", "机场",
+                  "港口", "物流", "快递", "航空公司"],
+    "农林牧渔": ["农业", "农林", "养殖", "畜牧", "渔业", "种植", "种子",
+                  "化肥农药", "牧原", "温氏"],
+    "环保":     ["环保", "污水处理", "固废", "大气治理", "生态修复"],
+    "美容护理": ["美容", "护肤", "化妆品", "医美", "彩妆"],
+    "综合":     ["综合", "控股集团"],
 }
 
-# Related US/global benchmark tickers per sector
+# Related US/global benchmark tickers per sector (Shenwan L1 keys)
 _SECTOR_BENCHMARKS: dict[str, list[tuple[str, str]]] = {
-    "科技": [("QQQ", "纳斯达克100 ETF"), ("XLK", "美国科技板块")],
-    "芯片/半导体": [("SOXX", "美半导体ETF"), ("TSM", "台积电"), ("NVDA", "英伟达")],
-    "AI/人工智能": [("NVDA", "英伟达"), ("MSFT", "微软"), ("GOOGL", "谷歌")],
-    "电力/能源": [("XLE", "美能源ETF"), ("ICLN", "全球清洁能源ETF")],
+    "电子":     [("SOXX", "美半导体ETF"), ("TSM", "台积电"), ("NVDA", "英伟达")],
+    "计算机":   [("QQQ", "纳斯达克100 ETF"), ("MSFT", "微软"), ("GOOGL", "谷歌")],
+    "通信":     [("QQQ", "纳斯达克100 ETF"), ("XLK", "美国科技板块")],
+    "电力设备": [("ICLN", "全球清洁能源ETF"), ("LIT", "锂电池ETF")],
+    "汽车":     [("TSLA", "特斯拉"), ("F", "福特")],
+    "机械设备": [("ARKQ", "自动化与机器人ETF"), ("ROBO", "全球机器人ETF")],
+    "国防军工": [("XAR", "美航空航天国防ETF"), ("LMT", "洛克希德马丁")],
+    "医药生物": [("XBI", "美生物科技ETF"), ("XPH", "美药品ETF")],
+    "食品饮料": [("XLP", "美必需消费ETF")],
+    "家用电器": [("XLY", "美可选消费ETF")],
+    "银行":     [("XLF", "美金融ETF"), ("KBE", "美银行ETF")],
+    "非银金融": [("XLF", "美金融ETF")],
     "有色金属": [("GLD", "黄金ETF"), ("COPX", "铜矿ETF"), ("LIT", "锂电池ETF")],
-    "消费": [("XLP", "美必需消费ETF"), ("XLY", "美可选消费ETF")],
-    "金融": [("XLF", "美金融ETF")],
-    "地产": [("XLRE", "美房地产ETF")],
+    "石油石化": [("XLE", "美能源ETF"), ("USO", "原油ETF")],
+    "房地产":   [("XLRE", "美房地产ETF")],
+    "基础化工": [("XLB", "美材料ETF")],
 }
 
-# Focus sectors the user cares about most
-FOCUS_SECTORS = {"科技", "芯片/半导体", "AI/人工智能", "电力/能源", "有色金属"}
+# Focus sectors — used in SWOT strengths (Shenwan L1 names)
+FOCUS_SECTORS = {"电子", "计算机", "电力设备", "有色金属", "机械设备", "医药生物"}
+
+# Shenwan L1 → macro group mapping (12 groups for 板块分析 heat-map grouping)
+SHENWAN_L1_TO_META: dict[str, str] = {
+    "电子": "科技", "计算机": "科技", "通信": "科技", "传媒": "科技",
+    "电力设备": "新能源", "公用事业": "新能源",
+    "汽车": "先进制造", "机械设备": "先进制造", "国防军工": "先进制造",
+    "医药生物": "医药",
+    "食品饮料": "消费", "家用电器": "消费", "纺织服饰": "消费",
+    "轻工制造": "消费", "商贸零售": "消费", "社会服务": "消费", "美容护理": "消费",
+    "银行": "金融", "非银金融": "金融",
+    "有色金属": "原材料", "基础化工": "原材料", "钢铁": "原材料",
+    "煤炭": "能源", "石油石化": "能源",
+    "房地产": "地产建筑", "建筑材料": "地产建筑", "建筑装饰": "地产建筑",
+    "交通运输": "交运",
+    "农林牧渔": "农业",
+    "环保": "环保",
+    "综合": "综合",
+}
 
 
 def classify_sector(ticker: str, name: str = "") -> str:
@@ -206,13 +277,531 @@ def estimate_sector_maturity(sector: str) -> str:
     defaults for the focus sectors as of 2025-2026.
     """
     mapping: dict[str, str] = {
-        "AI/人工智能": "期望膨胀期",
-        "芯片/半导体": "稳步爬升期",
-        "科技": "稳步爬升期",
-        "电力/能源": "稳步爬升期",
+        "计算机":   "期望膨胀期",
+        "电子":     "稳步爬升期",
+        "电力设备": "稳步爬升期",
+        "机械设备": "稳步爬升期",
         "有色金属": "成熟应用期",
-        "消费": "成熟应用期",
-        "金融": "成熟应用期",
-        "地产": "泡沫破裂期",
+        "食品饮料": "成熟应用期",
+        "银行":     "成熟应用期",
+        "非银金融": "成熟应用期",
+        "医药生物": "稳步爬升期",
+        "房地产":   "泡沫破裂期",
+        "煤炭":     "成熟应用期",
     }
     return mapping.get(sector, "成熟应用期")
+
+
+# ---------------------------------------------------------------------------
+# Sector representative stocks
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SectorStock:
+    ticker: str
+    name: str
+    desc: str
+
+
+# Representative A-share stocks per 申万一级行业 (Yahoo Finance ticker format)
+# Each sector keeps 8-10 curated entries that serve as robust fallback when
+# the Eastmoney dynamic API is unavailable or rate-limited.
+SECTOR_STOCKS: dict[str, list[SectorStock]] = {
+    "电子": [
+        SectorStock("688981.SS", "中芯国际",  "国内最先进集成电路代工企业（14nm量产）"),
+        SectorStock("002371.SZ", "北方华创",  "半导体设备国产化核心龙头"),
+        SectorStock("603501.SS", "韦尔股份",  "CMOS图像传感器设计国内第一"),
+        SectorStock("603986.SS", "兆易创新",  "NOR Flash/MCU领导企业"),
+        SectorStock("300782.SZ", "卓胜微",    "射频前端芯片国内龙头"),
+        SectorStock("300661.SZ", "圣邦股份",  "模拟芯片国产替代领导者"),
+        SectorStock("688008.SS", "澜起科技",  "DDR内存接口芯片/服务器芯片组"),
+        SectorStock("688012.SS", "中微公司",  "刻蚀设备与MOCVD设备国内龙头"),
+        SectorStock("688347.SS", "华虹半导体", "功率半导体与嵌入式闪存晶圆代工"),
+        SectorStock("002415.SZ", "海康威视",  "全球最大视频监控厂商，AIoT龙头"),
+    ],
+    "计算机": [
+        SectorStock("002230.SZ", "科大讯飞",  "AI语音与大模型全栈技术龙头"),
+        SectorStock("000977.SZ", "浪潮信息",  "国内最大服务器与AI基础设施厂商"),
+        SectorStock("603019.SS", "中科曙光",  "高性能计算与AI服务器龙头"),
+        SectorStock("600570.SS", "恒生电子",  "国内金融IT解决方案绝对龙头"),
+        SectorStock("300454.SZ", "深信服",    "网络安全与企业云计算龙头"),
+        SectorStock("600588.SS", "用友网络",  "财务/HR/ERP企业管理软件龙头"),
+        SectorStock("688111.SS", "金山办公",  "国产Office套件WPS核心企业"),
+        SectorStock("688256.SS", "寒武纪",    "国内顶尖AI推理芯片设计企业"),
+    ],
+    "通信": [
+        SectorStock("600941.SS", "中国移动",  "全球用户数最大移动运营商"),
+        SectorStock("600050.SS", "中国联通",  "国内5G混改标杆，云网融合提速"),
+        SectorStock("601728.SS", "中国电信",  "宽带与云计算业务快速增长"),
+        SectorStock("000063.SZ", "中兴通讯",  "5G核心设备与通信网络领导者"),
+        SectorStock("600498.SS", "烽火通信",  "光通信与网络设备专业厂商"),
+        SectorStock("300308.SZ", "中际旭创",  "400G/800G光模块全球龙头"),
+        SectorStock("002129.SZ", "中环股份",  "光伏用大硅片与通信光纤"),
+    ],
+    "电力设备": [
+        SectorStock("300750.SZ", "宁德时代",  "全球动力与储能电池装机量第一"),
+        SectorStock("601012.SS", "隆基绿能",  "全球最大单晶硅太阳能企业"),
+        SectorStock("300274.SZ", "阳光电源",  "光伏与储能逆变器全球龙头"),
+        SectorStock("002459.SZ", "晶澳科技",  "全球领先光伏组件供应商"),
+        SectorStock("600089.SS", "特变电工",  "输变电与新能源综合龙头"),
+        SectorStock("688599.SS", "天合光能",  "光伏组件全球前三，一体化布局"),
+        SectorStock("600438.SS", "通威股份",  "多晶硅料+电池片双龙头"),
+        SectorStock("002709.SZ", "天赐材料",  "锂电池电解液国内第一"),
+    ],
+    "汽车": [
+        SectorStock("002594.SZ", "比亚迪",    "全球新能源汽车销量第一"),
+        SectorStock("600104.SS", "上汽集团",  "国内最大汽车集团，新能源加速转型"),
+        SectorStock("601238.SS", "广汽集团",  "自主与合资多品牌汽车集团"),
+        SectorStock("000625.SZ", "长安汽车",  "自主乘用车与新能源转型典范"),
+        SectorStock("601633.SS", "长城汽车",  "SUV/皮卡/越野全球化龙头"),
+        SectorStock("002920.SZ", "德赛西威",  "智能座舱与车载系统一线供应商"),
+        SectorStock("600699.SS", "均胜电子",  "汽车安全与智能网联核心零部件商"),
+    ],
+    "机械设备": [
+        SectorStock("300124.SZ", "汇川技术",  "工业自动化与工业机器人国产龙头"),
+        SectorStock("600031.SS", "三一重工",  "全球最大工程机械企业之一"),
+        SectorStock("000425.SZ", "徐工机械",  "国内工程机械规模最大上市公司"),
+        SectorStock("601100.SS", "恒立液压",  "液压元件与智能控制龙头"),
+        SectorStock("000157.SZ", "中联重科",  "工程机械与智能农机双轮驱动"),
+        SectorStock("002747.SZ", "埃斯顿",    "工业机器人与运动控制国产领导者"),
+        SectorStock("300450.SZ", "先导智能",  "锂电池装备整线供应商龙头"),
+        SectorStock("688169.SS", "石头科技",  "扫地机器人与商用服务机器人领导者"),
+    ],
+    "国防军工": [
+        SectorStock("600760.SS", "中航沈飞",  "歼击机总装制造商，军机龙头"),
+        SectorStock("000768.SZ", "中航西飞",  "大型运输机与军民机总装制造商"),
+        SectorStock("600038.SS", "中直股份",  "直升机总装龙头"),
+        SectorStock("600372.SS", "中航电子",  "航空机载电子系统核心供应商"),
+        SectorStock("600893.SS", "航发动力",  "航空发动机整机与部件制造龙头"),
+        SectorStock("002179.SZ", "中航光电",  "军用高可靠连接器绝对龙头"),
+        SectorStock("002013.SZ", "中航机电",  "飞机机电与液压系统核心供应商"),
+        SectorStock("600150.SS", "中国船舶",  "驱逐舰/护卫舰总装制造国家队"),
+    ],
+    "医药生物": [
+        SectorStock("600276.SS", "恒瑞医药",  "国内创新药研发实力最强企业"),
+        SectorStock("603259.SS", "药明康德",  "全球最大CRO/CDMO服务商之一"),
+        SectorStock("300760.SZ", "迈瑞医疗",  "国内最大医疗器械上市公司"),
+        SectorStock("300015.SZ", "爱尔眼科",  "中国最大连锁眼科医院集团"),
+        SectorStock("600436.SS", "片仔癀",    "百年中成药品牌，消费属性极强"),
+        SectorStock("300122.SZ", "智飞生物",  "HPV/MenAC疫苗国产龙头"),
+        SectorStock("000963.SZ", "华东医药",  "化药/胰岛素/医美全链布局"),
+        SectorStock("000538.SZ", "云南白药",  "中药白药系列+日化双轮驱动"),
+    ],
+    "食品饮料": [
+        SectorStock("600519.SS", "贵州茅台",  "酱香白酒绝对龙头，A股市值标杆"),
+        SectorStock("000858.SZ", "五粮液",    "浓香型白酒领军品牌"),
+        SectorStock("600887.SS", "伊利股份",  "中国最大乳制品企业"),
+        SectorStock("603288.SS", "海天味业",  "酱油与调味品行业绝对龙头"),
+        SectorStock("002304.SZ", "洋河股份",  "全国化高端白酒第三极"),
+        SectorStock("000568.SZ", "泸州老窖",  "国窖1573高端浓香白酒"),
+        SectorStock("600600.SS", "青岛啤酒",  "中国最大啤酒品牌之一"),
+        SectorStock("600872.SS", "中炬高新",  "厨邦酱油调味品全国化品牌"),
+    ],
+    "家用电器": [
+        SectorStock("000651.SZ", "格力电器",  "全球最大家用空调制造企业"),
+        SectorStock("000333.SZ", "美的集团",  "多元家电与工业机器人综合巨头"),
+        SectorStock("600690.SS", "海尔智家",  "全球领先智慧家庭解决方案企业"),
+        SectorStock("002032.SZ", "苏泊尔",    "厨房电器龙头，SEB集团旗下"),
+        SectorStock("002508.SZ", "老板电器",  "高端厨房电器（烟灶蒸烤）龙头"),
+        SectorStock("002242.SZ", "九阳股份",  "豆浆机/破壁机等小家电龙头"),
+        SectorStock("603486.SS", "科沃斯",    "扫地/洗地机器人与服务机器人"),
+    ],
+    "银行": [
+        SectorStock("600036.SS", "招商银行",  "零售银行之王，ROE行业持续领先"),
+        SectorStock("601398.SS", "工商银行",  "全球资产规模最大商业银行"),
+        SectorStock("601939.SS", "建设银行",  "国有大行，住房金融优势突出"),
+        SectorStock("601288.SS", "农业银行",  "国有大行，三农与县域金融龙头"),
+        SectorStock("601328.SS", "交通银行",  "国有六大行，资产负债表稳健"),
+        SectorStock("601166.SS", "兴业银行",  "股份行绿色金融与对公业务领先"),
+        SectorStock("000001.SZ", "平安银行",  "股份行零售银行转型标杆"),
+        SectorStock("600016.SS", "民生银行",  "中小企业银行代表性股份行"),
+    ],
+    "非银金融": [
+        SectorStock("600030.SS", "中信证券",  "中国最大上市证券公司"),
+        SectorStock("601318.SS", "中国平安",  "中国最大综合保险金融集团"),
+        SectorStock("601211.SS", "国泰君安",  "综合实力顶尖的大型券商"),
+        SectorStock("601628.SS", "中国人寿",  "国内最大寿险上市公司"),
+        SectorStock("300059.SZ", "东方财富",  "互联网财富管理与基金销售龙头"),
+        SectorStock("600958.SS", "东方证券",  "资产管理特色鲜明的综合券商"),
+        SectorStock("000776.SZ", "广发证券",  "综合实力领先的大型上市券商"),
+        SectorStock("600999.SS", "招商证券",  "招商系综合券商，财富管理强劲"),
+    ],
+    "有色金属": [
+        SectorStock("601899.SS", "紫金矿业",  "国内最大黄金与铜矿综合企业"),
+        SectorStock("601600.SS", "中国铝业",  "国内最大氧化铝与电解铝企业"),
+        SectorStock("000630.SZ", "铜陵有色",  "国内大型铜冶炼加工企业"),
+        SectorStock("603993.SS", "洛阳钼业",  "全球钴钼储量领先的矿业集团"),
+        SectorStock("002460.SZ", "赣锋锂业",  "全球领先锂资源与锂电材料企业"),
+        SectorStock("002466.SZ", "天齐锂业",  "澳大利亚泰利森锂矿控股股东"),
+        SectorStock("600916.SS", "中国黄金",  "黄金矿采与零售全产业链央企"),
+        SectorStock("601168.SS", "西部矿业",  "铜铅锌综合矿业集团"),
+    ],
+    "石油石化": [
+        SectorStock("601857.SS", "中国石油",  "全球最大石油公司之一，国有能源巨头"),
+        SectorStock("600028.SS", "中国石化",  "国内最大炼油化工企业"),
+        SectorStock("600938.SS", "中国海油",  "海洋石油开采国内龙头"),
+        SectorStock("002493.SZ", "荣盛石化",  "国内最大民营炼化一体化企业之一"),
+        SectorStock("600688.SS", "上海石化",  "中国石化旗下炼化一体化子公司"),
+        SectorStock("600346.SS", "恒力石化",  "PTA/聚酯民营炼化一体化巨头"),
+    ],
+    "房地产": [
+        SectorStock("000002.SZ", "万科A",     "中国最大住宅开发商之一"),
+        SectorStock("600048.SS", "保利发展",  "央企地产龙头，安全边际高"),
+        SectorStock("001979.SZ", "招商蛇口",  "招商局旗下地产与城市运营商"),
+        SectorStock("600383.SS", "金地集团",  "专注高端住宅的全国化房企"),
+        SectorStock("000656.SZ", "金科股份",  "西南起家全国化住宅开发商"),
+        SectorStock("600606.SS", "绿地控股",  "超高层建筑与商业地产综合龙头"),
+    ],
+    "农林牧渔": [
+        SectorStock("002714.SZ", "牧原股份",  "国内最大自繁自养一体化猪企"),
+        SectorStock("300498.SZ", "温氏股份",  "多元化农牧食品集团"),
+        SectorStock("002311.SZ", "海大集团",  "水产饲料与动保龙头企业"),
+        SectorStock("000876.SZ", "新希望",    "综合性农牧食品产业链集团"),
+        SectorStock("600598.SS", "北大荒",    "千万亩耕地粮食生产国家队"),
+        SectorStock("300119.SZ", "瑞普生物",  "猪禽水产动物疫苗与保健品"),
+    ],
+}
+
+# Major market indices — displayed at the top of the sector page
+MAJOR_INDICES: list[tuple[str, str]] = [
+    ("000001", "上证指数"),
+    ("399001", "深证成指"),
+    ("899050", "北交所指数"),
+    ("HSI",    "恒生指数"),
+]
+
+
+def get_all_sectors() -> list[dict]:
+    """Return all sectors with their representative stocks."""
+    return [
+        {
+            "name": sector,
+            "stocks": [
+                {"ticker": s.ticker, "name": s.name, "desc": s.desc}
+                for s in stocks
+            ],
+        }
+        for sector, stocks in SECTOR_STOCKS.items()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic sector stock fetch — Eastmoney plate matching
+# ---------------------------------------------------------------------------
+
+# Per-sector plate name keywords (in priority order) that match Eastmoney plate names
+# returned by fetch_sector_list.  The first N matching plates are used for stock
+# aggregation (see _find_sector_plates).  Use actual plate names from the live list.
+_SHENWAN_PLATE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    # 电子 has no standalone L1 plate — use consumer-electronics sub-plates
+    "电子":     ("消费电子", "品牌消费电子", "消费电子零部件及组装"),
+    # 计算机 has no standalone plate in the live list
+    "计算机":   ("金融信息服务", "综合电商"),
+    "通信":     ("其他通信设备",),
+    "传媒":     ("其他数字媒体", "院线"),
+    # 电力设备 matches directly; enrich with active sub-plates
+    "电力设备": ("电力设备", "锂电池", "风电设备"),
+    "公用事业": ("燃气", "电网设备"),
+    "汽车":     ("汽车", "电动乘用车", "商用车"),
+    # 机械设备 matches directly; enrich with robotics/machinery sub-plates
+    "机械设备": ("机械设备", "工程机械", "机器人", "自动化设备"),
+    # 国防军工 matches directly; enrich with sub-sectors
+    "国防军工": ("国防军工", "航空装备Ⅱ", "航天装备Ⅱ", "军工电子Ⅱ"),
+    "医药生物": ("医药生物", "医疗器械", "医疗服务"),
+    "食品饮料": ("食品加工", "非白酒", "其他酒类"),
+    "家用电器": ("家用电器", "白色家电", "小家电"),
+    "纺织服饰": ("纺织服饰", "纺织制造"),
+    "轻工制造": ("轻工制造", "造纸"),
+    "商贸零售": ("多业态零售",),
+    "社会服务": ("酒店餐饮",),
+    # 银行 has no matching plate in the live list → uses SECTOR_STOCKS fallback
+    "银行":     (),
+    "非银金融": ("多元金融", "期货"),
+    "有色金属": ("铜", "铝", "黄金", "稀土"),
+    "基础化工": ("涂料", "改性塑料", "合成树脂"),
+    "钢铁":     ("钢结构", "金属制品"),
+    "煤炭":     ("煤炭", "煤炭开采", "焦煤"),
+    "石油石化": ("石油石化", "炼化及贸易", "其他石化"),
+    "房地产":   ("房地产综合服务", "物业管理", "房屋建设Ⅱ"),
+    "建筑材料": ("水泥制造", "水泥", "瓷砖地板"),
+    "建筑装饰": ("建筑装饰", "基础建设", "专业工程"),
+    "交通运输": ("铁路公路", "物流", "仓储物流"),
+    "农林牧渔": ("其他养殖", "其他农产品加工"),
+    "环保":     ("固废治理", "环境治理"),
+    "美容护理": ("洗护用品",),
+    "综合":     (),
+}
+
+
+def _find_sector_plates(
+    plates: list[dict], sector_name: str, max_plates: int = 3
+) -> list[dict]:
+    """Return up to `max_plates` Eastmoney plates for a Shenwan L1 sector.
+
+    Matching priority: exact name first, then substring match.  Multiple plates
+    are returned so the caller can aggregate stocks across sub-sectors.
+    """
+    keywords = _SHENWAN_PLATE_KEYWORDS.get(sector_name, (sector_name,))
+    found: list[dict] = []
+    used: set[str] = set()
+
+    # Pass 1 — exact name match (highest precision)
+    for kw in keywords:
+        if len(found) >= max_plates:
+            break
+        for plate in plates:
+            code = plate.get("code", "")
+            if code not in used and plate.get("name", "") == kw:
+                found.append(plate)
+                used.add(code)
+                break
+
+    # Pass 2 — substring match for remaining slots
+    for kw in keywords:
+        if len(found) >= max_plates:
+            break
+        for plate in plates:
+            code = plate.get("code", "")
+            if code in used:
+                continue
+            pname = plate.get("name", "")
+            if kw in pname or pname in kw:
+                found.append(plate)
+                used.add(code)
+                break
+
+    return found
+
+
+def get_sectors_with_market_data() -> list[dict]:
+    """Return all sectors enriched with live quotes and rankings.
+
+    Each sector dynamically fetches up to 10 stocks (minimum 3 guaranteed)
+    from the corresponding Eastmoney plate, sorted by real-time turnover.
+    Fixed SECTOR_STOCKS entries are used to supplement when the dynamic
+    count is low or the network is unavailable, and to supply desc text.
+
+    Rankings produced per sector:
+      - top_gainers:  sorted by change_pct desc  (今日涨幅)
+      - top_turnover: sorted by turnover desc     (资金活跃)
+      - top_volume:   sorted by volume desc        (成交量)
+    """
+    # Build a raw-code → desc lookup from fixed representative stocks
+    fixed_descs: dict[str, str] = {}
+    for stocks in SECTOR_STOCKS.values():
+        for s in stocks:
+            fixed_descs[s.ticker.split(".")[0]] = s.desc
+
+    # ── Phase 1: fetch Eastmoney plate catalogue once ──────────────────────
+    plates: list[dict] = []
+    try:
+        plates = fetch_sector_list(limit=220)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Phase 2: per-sector concurrent dynamic stock fetch ─────────────────
+    def _fetch_sector_stocks(sector_name: str) -> tuple[str, list[dict]]:
+        """Aggregate up to 10 dynamic stocks from matching plates; fall back to fixed list."""
+        matched = _find_sector_plates(plates, sector_name, max_plates=3) if plates else []
+
+        # Fetch from each matched plate and aggregate unique stocks
+        all_dynamic = []
+        seen_raw: set[str] = set()
+        for plate in matched:
+            try:
+                plate_stocks = fetch_sector_stock_list(
+                    sector_code=plate["code"], limit=12
+                )
+                for q in plate_stocks:
+                    raw = q.ticker.split(".")[0]
+                    if raw not in seen_raw:
+                        seen_raw.add(raw)
+                        all_dynamic.append(q)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Sort aggregated results by turnover descending, pick best 10
+        all_dynamic.sort(key=lambda q: q.turnover or 0, reverse=True)
+
+        stock_data: list[dict] = []
+        seen: set[str] = set()
+
+        for q in all_dynamic:
+            raw = q.ticker.split(".")[0]
+            if raw in seen:
+                continue
+            seen.add(raw)
+            stock_data.append({
+                "ticker": q.ticker,
+                "name": q.name,
+                "desc": fixed_descs.get(raw, ""),
+                "price": round(q.price, 2) if q.price is not None else None,
+                "change": round(q.change, 2),
+                "change_pct": round(q.change_pct, 2),
+                "turnover": q.turnover,
+                "volume": None,  # Eastmoney clist API does not return volume
+            })
+            if len(stock_data) >= 10:
+                break
+
+        # Supplement with fixed representative stocks (fills to 10 or guarantees ≥ 3)
+        for s in SECTOR_STOCKS.get(sector_name, []):
+            if len(stock_data) >= 10:
+                break
+            raw = s.ticker.split(".")[0]
+            if raw not in seen:
+                seen.add(raw)
+                stock_data.append({
+                    "ticker": s.ticker,
+                    "name": s.name,
+                    "desc": s.desc,
+                    "price": None,
+                    "change": None,
+                    "change_pct": None,
+                    "turnover": None,
+                    "volume": None,
+                })
+
+        return sector_name, stock_data
+
+    sector_names = list(SECTOR_STOCKS.keys())
+    raw_map: dict[str, list[dict]] = {}
+    workers = min(8, len(sector_names))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_sector_stocks, n): n for n in sector_names}
+        for fut in as_completed(futures, timeout=22):
+            sector_n = futures[fut]
+            try:
+                _, stocks = fut.result()
+                raw_map[sector_n] = stocks
+            except Exception:  # noqa: BLE001
+                raw_map[sector_n] = []
+
+    # ── Phase 3: batch-quote any stocks still missing live prices ──────────
+    # (covers fixed-stock fallbacks and tickers that the Eastmoney clist
+    #  returned without a valid price)
+    missing: list[str] = []
+    for stocks in raw_map.values():
+        for s in stocks:
+            if s["price"] is None:
+                raw = s["ticker"].split(".")[0]
+                if raw not in missing:
+                    missing.append(raw)
+
+    if missing:
+        try:
+            batch = get_batch_quotes_tencent(missing)
+            qmap: dict[str, dict] = {}
+            for q in batch:
+                raw = q.ticker.split(".")[0]
+                qmap[raw] = {
+                    "price": round(q.price, 2) if q.price is not None else None,
+                    "change": round(q.change, 2),
+                    "change_pct": round(q.change_pct, 2),
+                    "turnover": q.turnover,
+                    "volume": q.volume,
+                }
+            for stocks in raw_map.values():
+                for s in stocks:
+                    if s["price"] is None:
+                        raw = s["ticker"].split(".")[0]
+                        if raw in qmap:
+                            s.update(qmap[raw])
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Phase 4: assemble final result with rankings ───────────────────────
+    result: list[dict] = []
+    for sector_name in sector_names:
+        stock_data = raw_map.get(sector_name, [])
+        valid = [s for s in stock_data if s["price"] is not None]
+        result.append({
+            "name": sector_name,
+            "stocks": stock_data,
+            "top_gainers": sorted(
+                valid, key=lambda x: x["change_pct"] or 0, reverse=True
+            )[:5],
+            "top_turnover": sorted(
+                valid, key=lambda x: x["turnover"] or 0, reverse=True
+            )[:5],
+            "top_volume": sorted(
+                valid, key=lambda x: x["volume"] or 0, reverse=True
+            )[:5],
+        })
+
+    return result
+
+
+def get_major_indices() -> list[dict]:
+    """Fetch live quotes for major market indices.
+
+    Uses Tencent qt.gtimg.cn with special index symbol prefixes:
+      - sh000001 = 上证指数
+      - sz399001 = 深证成指
+      - bj899050 = 北交所指数 (fallback: sz899050)
+      - hkHSI    = 恒生指数
+    """
+    # Map (code, name) → Tencent symbol
+    symbol_map: dict[str, str] = {
+        "000001": "sh000001",
+        "399001": "sz399001",
+        "899050": "bj899050",
+        "HSI": "hkHSI",
+    }
+
+    symbols = list(symbol_map.values())
+    url = "http://qt.gtimg.cn/q=" + ",".join(symbols)
+
+    results: list[dict] = []
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:  # nosec B310
+            text = resp.read().decode("gbk", errors="ignore")
+    except Exception:  # noqa: BLE001 — catch IncompleteRead, URLError, etc.
+        return results
+
+    # Parse each line: v_sh000001="1~上证指数~000001~3352.00~..."
+    for code, label in MAJOR_INDICES:
+        sym = symbol_map.get(code, "")
+        # Find the line for this symbol
+        marker = f"v_{sym}=\""
+        idx = text.find(marker)
+        if idx < 0:
+            # Try fallback for 北交所: sz prefix
+            if code == "899050":
+                marker = 'v_sz899050="'
+                idx = text.find(marker)
+            if idx < 0:
+                results.append({"code": code, "name": label, "price": None,
+                                "change": None, "change_pct": None})
+                continue
+
+        start = idx + len(marker)
+        end = text.find('"', start)
+        payload = text[start:end] if end > start else ""
+        fields = payload.split("~")
+
+        if len(fields) < 5:
+            results.append({"code": code, "name": label, "price": None,
+                            "change": None, "change_pct": None})
+            continue
+
+        try:
+            price = float(fields[3])
+            prev = float(fields[4])
+            change = price - prev
+            change_pct = (change / prev * 100) if prev else 0.0
+        except (ValueError, IndexError):
+            results.append({"code": code, "name": label, "price": None,
+                            "change": None, "change_pct": None})
+            continue
+
+        results.append({
+            "code": code,
+            "name": fields[1] or label,
+            "price": round(price, 2),
+            "change": round(change, 2),
+            "change_pct": round(change_pct, 2),
+        })
+
+    return results

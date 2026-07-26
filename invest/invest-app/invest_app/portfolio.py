@@ -1,4 +1,5 @@
 """Portfolio management — loading, saving, and modifying holdings."""
+from __future__ import annotations
 
 import json
 from datetime import datetime
