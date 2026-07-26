@@ -8,6 +8,12 @@ import StockDetailPage from '@/pages/StockDetail'
 import WatchlistPage from '@/pages/WatchlistPage'
 import PortfolioPage from '@/pages/Portfolio'
 import BrokerImportPage from '@/pages/BrokerImport'
+import NewsPage from '@/pages/News'
+import IndustryPicksPage from './pages/IndustryPicksPage'
+import SectorPage from '@/pages/SectorPage'
+import AboutPage from '@/pages/AboutPage'
+import TradingPage from '@/pages/TradingPage'
+import BacktestPage from '@/pages/BacktestPage'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
     const user = useAuth((s) => s.user)
@@ -40,6 +46,12 @@ export default function App() {
                     <Route path="watchlist" element={<WatchlistPage />} />
                     <Route path="portfolio" element={<PortfolioPage />} />
                     <Route path="portfolio/import" element={<BrokerImportPage />} />
+                    <Route path="news" element={<NewsPage />} />
+                    <Route path="sectors" element={<SectorPage />} />
+                    <Route path="industry-picks" element={<IndustryPicksPage />} />
+                    <Route path="trading" element={<TradingPage />} />
+                    <Route path="backtest" element={<BacktestPage />} />
+                    <Route path="about" element={<AboutPage />} />
                 </Route>
             </Routes>
         </BrowserRouter>

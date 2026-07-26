@@ -10,7 +10,7 @@ import {
 
 interface WatchlistState {
   items: WatchlistItem[]
-  monitorTickers: string[]     // max 10 — pinned to realtime monitor
+  monitorTickers: string[]     // max 20 — pinned to realtime monitor
   loading: boolean
   loadWatchlist: () => Promise<void>
   loadMonitor: () => Promise<void>
@@ -58,7 +58,7 @@ export const useWatchlist = create<WatchlistState>((set, get) => ({
   },
 
   setMonitor: async (tickers) => {
-    const saved = await updateMonitor(tickers.slice(0, 10))
+    const saved = await updateMonitor(tickers.slice(0, 20))
     set({ monitorTickers: saved })
   },
 
@@ -68,8 +68,8 @@ export const useWatchlist = create<WatchlistState>((set, get) => ({
     if (monitorTickers.includes(ticker)) {
       next = monitorTickers.filter((t) => t !== ticker)
     } else {
-      if (monitorTickers.length >= 10) {
-        throw new Error('监控列表最多10只股票')
+      if (monitorTickers.length >= 20) {
+        throw new Error('监控列表最多20只股票')
       }
       next = [...monitorTickers, ticker]
     }

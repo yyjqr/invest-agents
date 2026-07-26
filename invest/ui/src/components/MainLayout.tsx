@@ -1,14 +1,86 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/useAuth'
 import {
-  Activity, BarChart2, BookOpen, LogOut, TrendingUp, User, Wallet,
+  Activity, BarChart2, BookOpen, FlaskConical, Info, Layers, LogOut, Newspaper, TrendingUp, User, Wallet,
 } from 'lucide-react'
+import { fetchNews } from '@/api/client'
+import type { NewsItem } from '@/types'
 
 const NAV_ITEMS = [
-  { to: '/monitor',   icon: Activity,   label: '实时监控' },
-  { to: '/watchlist', icon: BookOpen,   label: '自选股'   },
-  { to: '/portfolio', icon: Wallet,     label: '我的持仓' },
+  { to: '/sectors', icon: Layers, label: '板块分析' },
+  { to: '/industry-picks', icon: BarChart2, label: '行业精选' },
+  { to: '/monitor', icon: Activity, label: '实时监控' },
+  { to: '/watchlist', icon: BookOpen, label: '自选股' },
+  { to: '/portfolio', icon: Wallet, label: '我的持仓' },
+  { to: '/trading', icon: TrendingUp, label: '交易中心' },
+  { to: '/backtest', icon: FlaskConical, label: 'AI回测' },
+  { to: '/news', icon: Newspaper, label: '市场资讯' },
+  { to: '/about', icon: Info, label: '关于' },
 ]
+
+// ---------------------------------------------------------------------------
+// Scrolling news ticker (顶部跑马灯)
+// ---------------------------------------------------------------------------
+function NewsTicker() {
+  const [headlines, setHeadlines] = useState<NewsItem[]>([])
+  const trackRef = useRef<HTMLDivElement>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const items = await fetchNews('cn', 12)
+      setHeadlines(items)
+    } catch { /* ignore errors silently */ }
+  }, [])
+
+  useEffect(() => {
+    load()
+    const timer = setInterval(load, 5 * 60 * 1000)
+    return () => clearInterval(timer)
+  }, [load])
+
+  if (headlines.length === 0) return null
+
+  // Duplicate list so the scroll loops seamlessly
+  const doubled = [...headlines, ...headlines]
+
+  return (
+    <div className="flex-shrink-0 h-8 bg-slate-900 border-b border-slate-800
+                    flex items-center overflow-hidden relative">
+      {/* Label */}
+      <span className="flex-shrink-0 text-[10px] font-semibold tracking-widest
+                       text-blue-400 bg-blue-600/20 px-3 h-full flex items-center
+                       border-r border-slate-700 mr-0 z-10">
+        快讯
+      </span>
+      {/* Scrolling track */}
+      <div className="flex-1 overflow-hidden">
+        <div
+          ref={trackRef}
+          className="flex gap-0 whitespace-nowrap animate-ticker"
+          style={{ willChange: 'transform' }}
+        >
+          {doubled.map((item, i) => (
+            <a
+              key={i}
+              href={item.url || '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={item.title}
+              className="inline-flex items-center gap-2 px-4 text-[11px] text-slate-300
+                         hover:text-white transition-colors cursor-pointer"
+              onClick={(e) => { if (!item.url) e.preventDefault() }}
+            >
+              <span className="text-slate-600">◆</span>
+              {item.date && <span className="text-slate-600">{item.date}</span>}
+              <span>{item.title}</span>
+            </a>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export default function MainLayout() {
   const { user, logout } = useAuth()
@@ -76,9 +148,12 @@ export default function MainLayout() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-y-auto">
-        <Outlet />
-      </main>
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <NewsTicker />
+        <main className="flex-1 overflow-y-auto">
+          <Outlet />
+        </main>
+      </div>
     </div>
   )
 }
