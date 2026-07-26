@@ -2,7 +2,7 @@
  * BrokerImport — import portfolio holdings from various Chinese brokerages.
  *
  * Supports: 招商证券, 腾讯微证券, 长江证券, 东方财富, 同花顺,
- *           支付宝基金, 天天基金, 通用CSV, 手动JSON
+ *           支付宝基金, 天天基金, 通用CSV, 快速粘贴, 手动JSON/CSV
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -45,9 +45,12 @@ export default function BrokerImportPage() {
 
     // Manual add form
     const [manualTicker, setManualTicker] = useState('')
+    const [manualName, setManualName] = useState('')
     const [manualShares, setManualShares] = useState('')
     const [manualCost, setManualCost] = useState('')
     const [manualType, setManualType] = useState('stock')
+    const [manualBatchMode, setManualBatchMode] = useState(false)
+    const [manualBatchText, setManualBatchText] = useState('')
 
     useEffect(() => {
         fetchBrokers().then(setBrokers).catch(() => { })
@@ -128,6 +131,35 @@ export default function BrokerImportPage() {
         setLoading(false)
     }
 
+    // -- Manual batch paste (quick_paste broker) --
+    const doManualBatchPreview = async () => {
+        if (!manualBatchText.trim()) {
+            setError('请先输入持仓内容')
+            return
+        }
+        const quickBroker = brokers.find((b) => b.id === 'quick_paste')
+        if (!quickBroker) {
+            setError('快速粘贴功能暂不可用')
+            return
+        }
+        setLoading(true)
+        setError('')
+        try {
+            const res = await importPreview('quick_paste', manualBatchText)
+            setPreview(res)
+            setSelectedBroker(quickBroker)
+            setFileContent(manualBatchText)
+            if (res.holdings.length > 0) {
+                setStep('preview')
+            } else {
+                setError('未能解析到任何持仓数据，请检查格式：代码,名称,数量,成本价')
+            }
+        } catch (err: any) {
+            setError(err.message || '解析失败')
+        }
+        setLoading(false)
+    }
+
     const reset = () => {
         setStep('select')
         setSelectedBroker(null)
@@ -136,8 +168,11 @@ export default function BrokerImportPage() {
         setError('')
         setResult(null)
         setManualTicker('')
+        setManualName('')
         setManualShares('')
         setManualCost('')
+        setManualBatchMode(false)
+        setManualBatchText('')
     }
 
     // Group brokers
@@ -234,7 +269,7 @@ export default function BrokerImportPage() {
                             <p className="text-sm font-medium text-white mb-1">
                                 {selectedBroker.icon} {selectedBroker.name}
                             </p>
-                            <p className="text-xs text-slate-400 leading-relaxed">
+                            <p className="text-xs text-slate-400 leading-relaxed whitespace-pre-line">
                                 {selectedBroker.instructions}
                             </p>
                         </div>
@@ -263,17 +298,16 @@ export default function BrokerImportPage() {
 
                         {/* Or paste */}
                         <div>
-                            <p className="text-xs text-slate-500 mb-2">
-                                或直接粘贴内容
-                                {selectedBroker.id === 'manual_json' && '（JSON 格式）'}：
-                            </p>
+                            <p className="text-xs text-slate-500 mb-2">或直接粘贴内容：</p>
                             <textarea
                                 value={fileContent}
                                 onChange={(e) => setFileContent(e.target.value)}
                                 rows={8}
                                 placeholder={
                                     selectedBroker.id === 'manual_json'
-                                        ? '[{"ticker":"600519","shares":100,"cost_price":1500}]'
+                                        ? '[{"ticker":"600519","shares":100,"cost_price":1500}]\n\n// 也支持无表头 CSV：\n000630,铜陵有色,1300,6.795'
+                                        : selectedBroker.id === 'quick_paste'
+                                        ? '000630,铜陵有色,1300,6.795\n600519,贵州茅台,100,1800\n159915,创业板ETF,5000,1.23'
                                         : '证券代码,证券名称,持仓数量,成本价\n600519,贵州茅台,100,1455.02'
                                 }
                                 className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3
@@ -386,74 +420,147 @@ export default function BrokerImportPage() {
                 {/* ========= STEP: Manual Add ========= */}
                 {step === 'manual_add' && (
                     <div className="max-w-md mx-auto space-y-5">
-                        <p className="text-sm text-white font-medium">手动添加持仓</p>
-
-                        <div className="space-y-3">
-                            <div>
-                                <label className="text-xs text-slate-500 mb-1 block">股票/基金代码</label>
-                                <input
-                                    value={manualTicker}
-                                    onChange={(e) => setManualTicker(e.target.value)}
-                                    placeholder="如 600519 或 000858"
-                                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
-                             text-sm text-white focus:outline-none focus:border-blue-600/50"
-                                />
-                            </div>
-                            <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                    <label className="text-xs text-slate-500 mb-1 block">持仓数量</label>
-                                    <input
-                                        type="number"
-                                        value={manualShares}
-                                        onChange={(e) => setManualShares(e.target.value)}
-                                        placeholder="100"
-                                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
-                               text-sm text-white focus:outline-none focus:border-blue-600/50"
-                                    />
-                                </div>
-                                <div>
-                                    <label className="text-xs text-slate-500 mb-1 block">成本价</label>
-                                    <input
-                                        type="number"
-                                        step="0.01"
-                                        value={manualCost}
-                                        onChange={(e) => setManualCost(e.target.value)}
-                                        placeholder="1500.00"
-                                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
-                               text-sm text-white focus:outline-none focus:border-blue-600/50"
-                                    />
-                                </div>
-                            </div>
-                            <div>
-                                <label className="text-xs text-slate-500 mb-1 block">资产类型</label>
-                                <select
-                                    value={manualType}
-                                    onChange={(e) => setManualType(e.target.value)}
-                                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
-                             text-sm text-white focus:outline-none"
-                                >
-                                    <option value="stock">股票</option>
-                                    <option value="etf">ETF</option>
-                                    <option value="mutual_fund">基金</option>
-                                </select>
-                            </div>
+                        {/* Mode toggle */}
+                        <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-1">
+                            <button
+                                onClick={() => { setManualBatchMode(false); setError('') }}
+                                className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                                    !manualBatchMode
+                                        ? 'bg-blue-600 text-white'
+                                        : 'text-slate-400 hover:text-white'
+                                }`}
+                            >
+                                单条添加
+                            </button>
+                            <button
+                                onClick={() => { setManualBatchMode(true); setError('') }}
+                                className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                                    manualBatchMode
+                                        ? 'bg-blue-600 text-white'
+                                        : 'text-slate-400 hover:text-white'
+                                }`}
+                            >
+                                批量粘贴
+                            </button>
                         </div>
 
-                        {error && (
-                            <p className="text-sm text-red-400 flex items-center gap-1.5">
-                                <XCircle className="w-4 h-4" /> {error}
-                            </p>
-                        )}
+                        {!manualBatchMode ? (
+                            <>
+                                <div className="space-y-3">
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="text-xs text-slate-500 mb-1 block">股票/基金代码</label>
+                                            <input
+                                                value={manualTicker}
+                                                onChange={(e) => setManualTicker(e.target.value)}
+                                                placeholder="如 600519"
+                                                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
+                                     text-sm text-white focus:outline-none focus:border-blue-600/50"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="text-xs text-slate-500 mb-1 block">名称（可选）</label>
+                                            <input
+                                                value={manualName}
+                                                onChange={(e) => setManualName(e.target.value)}
+                                                placeholder="如 贵州茅台"
+                                                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
+                                     text-sm text-white focus:outline-none focus:border-blue-600/50"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="text-xs text-slate-500 mb-1 block">持仓数量</label>
+                                            <input
+                                                type="number"
+                                                value={manualShares}
+                                                onChange={(e) => setManualShares(e.target.value)}
+                                                placeholder="100"
+                                                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
+                                       text-sm text-white focus:outline-none focus:border-blue-600/50"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="text-xs text-slate-500 mb-1 block">成本价</label>
+                                            <input
+                                                type="number"
+                                                step="0.01"
+                                                value={manualCost}
+                                                onChange={(e) => setManualCost(e.target.value)}
+                                                placeholder="1500.00"
+                                                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
+                                       text-sm text-white focus:outline-none focus:border-blue-600/50"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className="text-xs text-slate-500 mb-1 block">资产类型</label>
+                                        <select
+                                            value={manualType}
+                                            onChange={(e) => setManualType(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5
+                                     text-sm text-white focus:outline-none"
+                                        >
+                                            <option value="stock">股票</option>
+                                            <option value="etf">ETF</option>
+                                            <option value="mutual_fund">基金</option>
+                                        </select>
+                                    </div>
+                                </div>
 
-                        <button
-                            onClick={doManualAdd}
-                            disabled={loading}
-                            className="w-full py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium
-                         hover:bg-blue-500 disabled:opacity-50 flex items-center justify-center gap-2"
-                        >
-                            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                            添加到持仓
-                        </button>
+                                {error && (
+                                    <p className="text-sm text-red-400 flex items-center gap-1.5">
+                                        <XCircle className="w-4 h-4" /> {error}
+                                    </p>
+                                )}
+
+                                <button
+                                    onClick={doManualAdd}
+                                    disabled={loading}
+                                    className="w-full py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium
+                             hover:bg-blue-500 disabled:opacity-50 flex items-center justify-center gap-2"
+                                >
+                                    {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                                    添加到持仓
+                                </button>
+                            </>
+                        ) : (
+                            <>
+                                <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+                                    <p className="text-xs text-slate-400 leading-relaxed">
+                                        每行一条，格式：<span className="font-mono text-slate-300">代码,名称,数量,成本价</span>
+                                        <br />
+                                        名称可省略：<span className="font-mono text-slate-300">代码,数量,成本价</span>
+                                    </p>
+                                </div>
+                                <textarea
+                                    value={manualBatchText}
+                                    onChange={(e) => setManualBatchText(e.target.value)}
+                                    rows={10}
+                                    placeholder={`000630,铜陵有色,1300,6.795\n600519,贵州茅台,100,1800\n159915,创业板ETF,5000,1.23`}
+                                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3
+                             text-sm text-slate-300 font-mono resize-none
+                             focus:outline-none focus:border-blue-600/50"
+                                />
+
+                                {error && (
+                                    <p className="text-sm text-red-400 flex items-center gap-1.5">
+                                        <XCircle className="w-4 h-4" /> {error}
+                                    </p>
+                                )}
+
+                                <button
+                                    onClick={doManualBatchPreview}
+                                    disabled={loading || !manualBatchText.trim()}
+                                    className="w-full py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium
+                             hover:bg-blue-500 disabled:opacity-50 flex items-center justify-center gap-2"
+                                >
+                                    {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
+                                    解析预览
+                                </button>
+                            </>
+                        )}
                     </div>
                 )}
 

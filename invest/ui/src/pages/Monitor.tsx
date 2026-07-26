@@ -1,5 +1,5 @@
 /**
- * Monitor page — real-time price monitoring for up to 10 stocks.
+ * Monitor page — real-time price monitoring for up to 20 stocks.
  * Prices are pushed via WebSocket every 5 seconds.
  * Users can add/remove stocks from their personal monitor list.
  */
@@ -44,7 +44,13 @@ export default function MonitorPage() {
         setLastUpdated(new Date())
         setQuotes((prev) => {
           const updated = { ...prev }
-          newQuotes.forEach((q) => { updated[q.ticker] = q })
+          newQuotes.forEach((q) => {
+            updated[q.ticker] = q
+            // Also index by bare code (strip exchange suffix like .SS/.SZ/.BJ)
+            // so monitorTickers like '600900' can look up quotes from '600900.SS'
+            const bare = q.ticker.replace(/\.(SS|SZ|BJ)$/i, '')
+            if (bare !== q.ticker) updated[bare] = q
+          })
           return updated
         })
       })
@@ -96,7 +102,7 @@ export default function MonitorPage() {
           <h1 className="text-lg font-bold text-white">实时监控</h1>
           <p className="text-xs text-slate-500 mt-0.5">
             {monitorTickers.length > 0
-              ? `${monitorTickers.length}/10 只股票 · 每5秒自动刷新`
+              ? `${monitorTickers.length}/20 只股票 · 每5秒自动刷新`
               : '添加股票开始监控'}
           </p>
         </div>
@@ -120,7 +126,7 @@ export default function MonitorPage() {
           )}
 
           {/* Add button */}
-          {monitorTickers.length < 10 && (
+          {monitorTickers.length < 20 && (
             <button
               onClick={() => setShowSearch(!showSearch)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700
