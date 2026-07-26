@@ -58,7 +58,43 @@ if (-not (Test-Path $venvPy)) {
 
 # ── 2. 更新 Python 依赖 ──────────────────────────────────────────────────────
 Write-Host "[1/4] 检查 Python 依赖..." -ForegroundColor Yellow
-& $venvPy -m pip install fastapi "uvicorn[standard]" python-multipart -q
+# 检查关键包是否已安装（包含全量依赖）
+$checkPkgs = @("fastapi", "uvicorn", "multipart", "pandas", "yfinance", "numpy", "langgraph")
+$missingPkg = $false
+foreach ($pkg in $checkPkgs) {
+    & $venvPy -c "import $pkg" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $missingPkg = $true; break
+    }
+}
+if ($missingPkg) {
+    Write-Host "  安装缺失依赖（从 requirements.txt）..." -ForegroundColor DarkGray
+    # NO_PROXY=* 跳过 Windows 注册表代理（避免 pip 21 urllib3 TLS-over-TLS bug）
+    $env:NO_PROXY = "*"
+    & $venvPy -m pip install -r "$Root\invest-app\requirements.txt" -q
+    if ($LASTEXITCODE -ne 0) {
+        # WinError 32: plotly 等包被 VS Code/Pylance 锁住，跳过整体安装，逐个安装缺失包
+        Write-Host "  ⚠ 全量安装失败（文件占用），尝试逐包安装..." -ForegroundColor Yellow
+        $pkgMap = @{
+            "pandas"     = "pandas>=2.0.0"
+            "yfinance"   = "yfinance>=0.2.30"
+            "numpy"      = "numpy>=1.24.0"
+            "langgraph"  = "langgraph>=0.2.0"
+            "rich"       = "rich>=13.0.0"
+            "matplotlib" = "matplotlib>=3.7.0"
+        }
+        foreach ($pkg in $pkgMap.Keys) {
+            & $venvPy -c "import $pkg" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "    安装 $pkg ..." -ForegroundColor DarkGray
+                & $venvPy -m pip install $pkgMap[$pkg] -q
+            }
+        }
+    }
+    Write-Host "  依赖已更新" -ForegroundColor DarkGray
+} else {
+    Write-Host "  依赖已就绪，跳过安装" -ForegroundColor DarkGray
+}
 
 # ── 3. 启动 FastAPI 后端 ─────────────────────────────────────────────────────
 Write-Host "[2/4] 启动 FastAPI 后端 (http://127.0.0.1:8765)..." -ForegroundColor Yellow

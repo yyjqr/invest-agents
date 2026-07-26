@@ -152,10 +152,10 @@ $venvDir = "$Root\invest-app\.venv"
 $venvPy  = "$venvDir\Scripts\python.exe"
 
 if (-not (Test-Path $venvPy)) {
-    Write-Host "[Python] 创建虚拟环境..." -ForegroundColor Yellow
-    python -m venv $venvDir
+    Write-Host "[Python] 创建虚拟环境（Python 3.12）..." -ForegroundColor Yellow
+    py -3.12 -m venv $venvDir
     if (-not (Test-Path $venvPy)) {
-        Write-Host "[ERROR] 虚拟环境创建失败，请确认 Python 3.11+ 已安装" -ForegroundColor Red
+        Write-Host "[ERROR] 虚拟环境创建失败，请确认 Python 3.12 已安装" -ForegroundColor Red
         exit 1
     }
     Write-Host "  ✓ 虚拟环境已创建" -ForegroundColor Green
