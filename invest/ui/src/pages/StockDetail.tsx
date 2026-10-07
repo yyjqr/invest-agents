@@ -7,9 +7,9 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, BookmarkPlus, RefreshCw, Save, TrendingUp, AlertCircle, Building2 } from 'lucide-react'
 import KLineChart from '@/components/KLineChart'
 import StrategyPanel from '@/components/StrategyPanel'
-import { fetchHistory, fetchIntraday, fetchStrategy, fetchForecast, fetchQuote, fetchStockProfile, saveForecastRecord, fetchResearchReports } from '@/api/client'
+import { fetchHistory, fetchIntraday, fetchStrategy, fetchForecast, fetchQuote, fetchStockProfile, fetchValueAnalysis, saveForecastRecord, fetchResearchReports } from '@/api/client'
 import { useWatchlist } from '@/store/useWatchlist'
-import type { OHLCV, StrategyReport, Forecast, Quote, StockProfile, NewsItem } from '@/types'
+import type { OHLCV, StrategyReport, Forecast, Quote, StockProfile, NewsItem, ValueAnalysis } from '@/types'
 
 const PERIODS = ['5d', '1mo', '3mo', '6mo', '1y', '2y'] as const
 type Period = typeof PERIODS[number]
@@ -31,6 +31,7 @@ export default function StockDetailPage() {
   const [forecast, setForecast] = useState<Forecast | null>(null)
   const [forecastHorizon, setForecastHorizon] = useState<'1h' | '1d' | '1w' | '1m' | '3m'>('1d')
   const [profile, setProfile] = useState<StockProfile | null>(null)
+  const [valueAnalysis, setValueAnalysis] = useState<ValueAnalysis | null>(null)
   const [stockNews, setStockNews] = useState<NewsItem[]>([])
   const [loadingChart, setLoadingChart] = useState(false)
   const [loadingStrategy, setLoadingStrategy] = useState(false)
@@ -101,6 +102,7 @@ export default function StockDetailPage() {
     } catch {}
     // Load profile in background (non-critical)
     fetchStockProfile(ticker).then(setProfile).catch(() => {})
+    fetchValueAnalysis(ticker).then(setValueAnalysis).catch(() => {})
     fetchResearchReports({ ticker, limit: 6 }).then(setStockNews).catch(() => {})
     setLoadingStrategy(false)
   }
@@ -454,6 +456,142 @@ export default function StockDetailPage() {
                       </p>
                     ))}
                   </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* BMP 价值投资分析面板 */}
+          {valueAnalysis && (
+            <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <TrendingUp className="w-4 h-4 text-amber-400" />
+                <h3 className="text-sm font-semibold text-white">BMP 价值分析</h3>
+                {valueAnalysis.f_label && (
+                  <span className={`ml-auto text-[10px] px-2 py-0.5 rounded-full border font-medium ${
+                    valueAnalysis.f_score != null && valueAnalysis.f_score >= 7
+                      ? 'bg-green-950/50 text-green-400 border-green-900/40'
+                      : valueAnalysis.f_score != null && valueAnalysis.f_score >= 5
+                        ? 'bg-yellow-950/50 text-yellow-400 border-yellow-900/40'
+                        : 'bg-red-950/50 text-red-400 border-red-900/40'
+                  }`}>
+                    F-Score {valueAnalysis.f_score ?? '—'}/9 · {valueAnalysis.f_label}
+                  </span>
+                )}
+              </div>
+
+              {valueAnalysis.degraded && (
+                <p className="text-[10px] text-slate-500 mb-2 italic">
+                  ⚠ 财务数据获取受限，仅展示行情数据
+                </p>
+              )}
+
+              {/* 三维评分 */}
+              {!valueAnalysis.degraded && valueAnalysis.total_score != null && (
+                <div className="grid grid-cols-4 gap-2 text-center mb-3">
+                  {[
+                    { label: '综合', val: valueAnalysis.total_score, color: 'text-amber-400' },
+                    { label: '价值', val: valueAnalysis.value_score, color: 'text-blue-400' },
+                    { label: '成长', val: valueAnalysis.growth_score, color: 'text-green-400' },
+                    { label: '质量', val: valueAnalysis.quality_score, color: 'text-purple-400' },
+                  ].map(({ label, val, color }) => (
+                    <div key={label}>
+                      <p className="text-[10px] text-slate-500">{label}</p>
+                      <p className={`text-sm font-bold font-mono ${color}`}>
+                        {val != null ? val.toFixed(1) : '—'}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 护城河评分 */}
+              {valueAnalysis.moat_score != null && (
+                <div className="mb-3">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] text-slate-500">护城河强度</span>
+                    <span className={`text-[10px] font-mono font-semibold ${
+                      valueAnalysis.moat_score >= 65 ? 'text-green-400'
+                        : valueAnalysis.moat_score >= 40 ? 'text-yellow-400'
+                        : 'text-red-400'
+                    }`}>
+                      {valueAnalysis.moat_score.toFixed(0)}/100
+                      {valueAnalysis.moat_score >= 65 ? ' 强' : valueAnalysis.moat_score >= 40 ? ' 中' : ' 弱'}
+                    </span>
+                  </div>
+                  <div className="relative h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                    <div
+                      className={`absolute left-0 top-0 h-full rounded-full transition-all ${
+                        valueAnalysis.moat_score >= 65 ? 'bg-green-500'
+                          : valueAnalysis.moat_score >= 40 ? 'bg-yellow-500'
+                          : 'bg-red-500'
+                      }`}
+                      style={{ width: `${valueAnalysis.moat_score}%` }}
+                    />
+                  </div>
+                  {/* 护城河三维拆解 */}
+                  {valueAnalysis.moat_detail && (
+                    <div className="mt-2 grid grid-cols-3 gap-1 text-center">
+                      {[
+                        { label: '毛利水平', val: valueAnalysis.moat_detail.gm_level },
+                        { label: 'ROE水平', val: valueAnalysis.moat_detail.roe_level },
+                        { label: '利率稳定', val: valueAnalysis.moat_detail.margin_stab },
+                      ].map(({ label, val }) => (
+                        <div key={label} className="bg-slate-800/50 rounded px-1 py-0.5">
+                          <p className="text-[9px] text-slate-600">{label}</p>
+                          <p className="text-[10px] font-mono text-slate-300">
+                            {val != null ? val.toFixed(0) : '—'}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* F-Score 明细 */}
+              {valueAnalysis.f_checks && Object.keys(valueAnalysis.f_checks).length > 0 && (
+                <div className="mb-3">
+                  <p className="text-[10px] text-slate-500 mb-1">Piotroski F-Score 明细</p>
+                  <div className="flex flex-wrap gap-1">
+                    {Object.entries(valueAnalysis.f_checks).map(([k, v]) => (
+                      <span
+                        key={k}
+                        className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+                          v ? 'bg-green-950/60 text-green-400 border border-green-900/40'
+                            : 'bg-red-950/60 text-red-400 border border-red-900/40'
+                        }`}
+                      >
+                        {k} {v ? '✓' : '✗'}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* 关键因子行 */}
+              {!valueAnalysis.degraded && valueAnalysis.factors && (
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                  {valueAnalysis.financials_summary?.gross_margin != null && (
+                    <span>毛利率 <span className="text-slate-300">{valueAnalysis.financials_summary.gross_margin.toFixed(1)}%</span></span>
+                  )}
+                  {valueAnalysis.factors.roe_3y_avg != null && (
+                    <span>3年均ROE <span className="text-slate-300">{valueAnalysis.factors.roe_3y_avg.toFixed(1)}%</span></span>
+                  )}
+                  {valueAnalysis.owner_earnings_yield != null && (
+                    <span>盈利收益率 <span className="text-slate-300">{valueAnalysis.owner_earnings_yield.toFixed(2)}%</span></span>
+                  )}
+                  {valueAnalysis.factors.ocf_to_profit != null && (
+                    <span>OCF质量 <span className="text-slate-300">{valueAnalysis.factors.ocf_to_profit.toFixed(2)}x</span></span>
+                  )}
+                  {valueAnalysis.factors.revenue_cagr_3y != null && (
+                    <span>营收CAGR <span className={valueAnalysis.factors.revenue_cagr_3y >= 0 ? 'text-bull' : 'text-bear'}>
+                      {valueAnalysis.factors.revenue_cagr_3y >= 0 ? '+' : ''}{valueAnalysis.factors.revenue_cagr_3y.toFixed(1)}%
+                    </span></span>
+                  )}
+                  {valueAnalysis.factors.debt_ratio != null && (
+                    <span>负债率 <span className="text-slate-300">{valueAnalysis.factors.debt_ratio.toFixed(0)}%</span></span>
+                  )}
                 </div>
               )}
             </div>

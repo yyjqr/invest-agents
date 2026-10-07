@@ -206,6 +206,82 @@ export interface CompanyAnalysis {
   }>
 }
 
+/** BMP 价值分析 — F-Score + 护城河 + 三维评分 */
+export interface ValueAnalysis {
+  ticker: string
+  name: string
+  price: number | null
+  pe_ttm: number | null
+  pb_ratio: number | null
+  market_cap_total: number | null
+  // Piotroski F-Score
+  f_score: number | null
+  f_label: string | null
+  f_checks: Record<string, number>   // { F1: 1, F2: 0, ... }
+  // 护城河
+  moat_score: number | null          // 0–100，越高护城河越强
+  moat_detail: {
+    gm_level?: number       // 毛利率水平得分
+    roe_level?: number      // ROE 水平得分
+    margin_stab?: number    // 毛利率稳定性得分
+    avg_roe_pct?: number    // 3 年均 ROE (%)
+  }
+  owner_earnings_yield: number | null  // 股东盈利收益率 % = OCF/市值
+  // BMP 三维得分
+  value_score: number | null
+  growth_score: number | null
+  quality_score: number | null
+  total_score: number | null
+  market_regime: string
+  // 底层因子
+  factors: {
+    pe_percentile?: number | null
+    pb_percentile?: number | null
+    dividend_yield?: number | null
+    fcf_to_ev?: number | null
+    owner_earnings_yield?: number | null
+    revenue_cagr_3y?: number | null
+    net_profit_cagr_3y?: number | null
+    rd_intensity?: number | null
+    roe_3y_avg?: number | null
+    gross_margin_stability?: number | null
+    ocf_to_profit?: number | null
+    debt_ratio?: number | null
+    profit_stability?: number | null
+    revenue_stability?: number | null
+    moat_score?: number | null
+  }
+  financials_summary: {
+    report_date?: string
+    sector?: string
+    gross_margin?: number | null
+    roe?: number | null
+    debt_ratio?: number | null
+    ocf?: number | null
+    net_profit?: number | null
+    revenue?: number | null
+  }
+  degraded: boolean
+  degraded_reason: string | null
+  recommendation?: string
+  recommendation_color?: string
+}
+
+/** 关注列表 BMP 算法推荐排名条目 */
+export interface WatchlistRankedItem extends ValueAnalysis {
+  rank: number
+  note: string
+  data_quality: 'full' | 'quote_only' | 'failed'
+  recommendation: string
+  recommendation_color: string
+}
+
+export interface WatchlistRanked {
+  ranked: WatchlistRankedItem[]
+  updated_at: string
+  count: number
+}
+
 export interface NewsAnalysis {
   provider: string
   summary: string

@@ -198,6 +198,14 @@ export async function fetchStockProfile(ticker: string): Promise<StockProfile> {
   return _fetch(`/api/stocks/profile/${encodeURIComponent(ticker)}`)
 }
 
+export async function fetchValueAnalysis(ticker: string): Promise<import('../types').ValueAnalysis> {
+  return _fetch(`/api/stocks/value-analysis/${encodeURIComponent(ticker)}`)
+}
+
+export async function fetchWatchlistRanked(): Promise<import('../types').WatchlistRanked> {
+  return _fetch('/api/watchlist/ranked')
+}
+
 // ---------------------------------------------------------------------------
 // Strategy & Forecast
 // ---------------------------------------------------------------------------

@@ -3,9 +3,9 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Wallet, TrendingUp, TrendingDown, Upload, Pencil, X, Trash2, BarChart2, Download } from 'lucide-react'
-import { fetchBatchQuotes, fetchPortfolio, addPortfolioHolding, deletePortfolioHolding, sellPortfolioHolding, editPortfolioHolding, PriceWebSocket, downloadPortfolioCsv } from '@/api/client'
-import type { Quote } from '@/types'
+import { RefreshCw, Wallet, Upload, Pencil, X, Trash2, BarChart2, Download, History } from 'lucide-react'
+import { fetchBatchQuotes, fetchPortfolio, addPortfolioHolding, deletePortfolioHolding, sellPortfolioHolding, editPortfolioHolding, PriceWebSocket, downloadPortfolioCsv, fetchForecastHistory, deleteForecastRecord, clearForecastHistory } from '@/api/client'
+import type { ForecastRecord, Quote } from '@/types'
 
 interface Holding {
   ticker: string
@@ -19,11 +19,157 @@ interface Portfolio {
   cash: number
 }
 
+type ForecastRow = ForecastRecord & { originalIndex: number }
+type ForecastSeriesKey = 'predicted' | 'high' | 'low'
+
+function fmt(n: number | null | undefined, d = 2) {
+  return n == null ? '—' : n.toFixed(d)
+}
+
+function ForecastSparkline({ items, series }: { items: ForecastRow[]; series: ForecastSeriesKey }) {
+  if (items.length < 2) {
+    return <div className="h-20 flex items-center justify-center text-[10px] text-slate-600">记录不足</div>
+  }
+
+  const width = 260
+  const height = 80
+  const pad = 8
+  const selected = items.map((item) => (
+    series === 'high' ? item.predicted_high : series === 'low' ? item.predicted_low : item.predicted_price
+  ))
+  const current = items.map((item) => item.current_price)
+  const values = [...selected, ...current]
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const span = max - min || 1
+  const stepX = (width - pad * 2) / Math.max(items.length - 1, 1)
+  const scaleY = (value: number) => height - pad - ((value - min) / span) * (height - pad * 2)
+  const scaleX = (index: number) => pad + index * stepX
+
+  const line = (series: number[]) => series.map((value, index) => `${scaleX(index)},${scaleY(value)}`).join(' ')
+  const stroke = series === 'high' ? 'rgb(34 197 94)' : series === 'low' ? 'rgb(248 113 113)' : 'rgb(96 165 250)'
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-20">
+      <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} className="stroke-slate-800" strokeWidth="1" />
+      <polyline fill="none" stroke={stroke} strokeWidth="2" points={line(selected)} />
+      <polyline fill="none" stroke="rgb(148 163 184)" strokeWidth="1.5" strokeDasharray="4 3" points={line(current)} />
+      {selected.map((value, index) => (
+        <circle key={`p-${index}`} cx={scaleX(index)} cy={scaleY(value)} r="2.4" fill={stroke} />
+      ))}
+    </svg>
+  )
+}
+
+function ForecastGroupCard({
+  ticker,
+  rows,
+  isHolding,
+  busy,
+  onDelete,
+}: {
+  ticker: string
+  rows: ForecastRow[]
+  isHolding: boolean
+  busy: boolean
+  onDelete: (index: number) => void
+}) {
+  const navigate = useNavigate()
+  const [series, setSeries] = useState<ForecastSeriesKey>('predicted')
+  const ordered = [...rows].sort((a, b) => a.date.localeCompare(b.date))
+  const latest = ordered[ordered.length - 1]
+
+  const seriesValue =
+    series === 'high' ? latest.predicted_high : series === 'low' ? latest.predicted_low : latest.predicted_price
+
+  const seriesLabel = series === 'high' ? '预测高点' : series === 'low' ? '预测低点' : '预测价格'
+
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <button
+          onClick={() => navigate(`/stock/${encodeURIComponent(ticker)}`)}
+          className="text-left group"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-blue-400 group-hover:text-blue-300 transition-colors">{ticker}</span>
+            {isHolding && <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-600/15 text-blue-300 border border-blue-600/20">持仓中</span>}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">{latest.name || '—'} · {ordered.length} 条记录</div>
+        </button>
+        <button
+          onClick={() => onDelete(latest.originalIndex)}
+          disabled={busy}
+          className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-slate-800 transition-colors disabled:opacity-50"
+          title="删除最新一条记录"
+        >
+          <Trash2 className="w-4 h-4" />
+        </button>
+      </div>
+
+      <div className="flex items-center gap-1.5 mb-2">
+        {([
+          ['predicted', '预测'],
+          ['high', '高点'],
+          ['low', '低点'],
+        ] as const).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setSeries(key)}
+            className={`px-2 py-1 rounded-md text-[10px] transition-colors ${
+              series === key
+                ? key === 'high'
+                  ? 'bg-green-600/20 text-green-300 border border-green-600/30'
+                  : key === 'low'
+                  ? 'bg-red-600/20 text-red-300 border border-red-600/30'
+                  : 'bg-blue-600/20 text-blue-300 border border-blue-600/30'
+                : 'bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <ForecastSparkline items={ordered} series={series} />
+
+      <div className="grid grid-cols-4 gap-3 mt-3 text-center">
+        <div>
+          <p className="text-[10px] text-slate-500 mb-1">{seriesLabel}</p>
+          <p className="text-sm font-mono text-white">{fmt(seriesValue)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-slate-500 mb-1">当前价</p>
+          <p className="text-sm font-mono text-slate-300">{fmt(latest.current_price)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-slate-500 mb-1">预期收益</p>
+          <p className={`text-sm font-mono ${latest.expected_return_pct >= 0 ? 'text-bull' : 'text-bear'}`}>
+            {latest.expected_return_pct >= 0 ? '+' : ''}{fmt(latest.expected_return_pct)}%
+          </p>
+        </div>
+        <div>
+          <p className="text-[10px] text-slate-500 mb-1">最新周期</p>
+          <p className="text-sm text-slate-300">{latest.horizon}</p>
+        </div>
+      </div>
+
+      <div className="mt-3 pt-3 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-500">
+        <span>首条 {ordered[0].date.replace('T', ' ')}</span>
+        <span>最新 {latest.date.replace('T', ' ')}</span>
+      </div>
+    </div>
+  )
+}
+
 export default function PortfolioPage() {
   const navigate = useNavigate()
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null)
   const [quotes, setQuotes] = useState<Record<string, Quote>>({})
+  const [forecastRows, setForecastRows] = useState<ForecastRow[]>([])
   const [loading, setLoading] = useState(false)
+  const [forecastBusy, setForecastBusy] = useState(false)
+  const [forecastErr, setForecastErr] = useState('')
   const wsRef = useRef<PriceWebSocket | null>(null)
 
   // Edit modal state
@@ -39,9 +185,14 @@ export default function PortfolioPage() {
 
   const load = async () => {
     setLoading(true)
+    setForecastErr('')
     try {
-      const data = await fetchPortfolio()
+      const [data, history] = await Promise.all([
+        fetchPortfolio(),
+        fetchForecastHistory().catch(() => [] as ForecastRecord[]),
+      ])
       setPortfolio(data)
+      setForecastRows(history.map((item, index) => ({ ...item, originalIndex: index })).reverse())
       const tickers = Object.keys(data.holdings)
       if (tickers.length) {
         const qs = await fetchBatchQuotes(tickers)
@@ -113,8 +264,11 @@ export default function PortfolioPage() {
       } else {
         const s = parseFloat(fAdjShares)
         const c = parseFloat(fAdjCost)
-        if (!(s > 0)) throw new Error('持仓数量必须大于 0')
-        if (!(c > 0)) throw new Error('请输入有效成本价')
+        if (isNaN(s) || s < 0) throw new Error('持仓数量不能为负数')
+        if (editH.asset_type === 'stock' && s > 0 && s < 100) {
+          throw new Error('A股持仓数量应为 0 或不少于 100 股')
+        }
+        if (isNaN(c) || c < 0) throw new Error('请输入有效成本价')
         await editPortfolioHolding(editH.ticker, s, c)
       }
       closeEdit()
@@ -141,8 +295,48 @@ export default function PortfolioPage() {
     }
   }
 
+  const handleDeleteForecast = async (index: number) => {
+    setForecastBusy(true)
+    setForecastErr('')
+    try {
+      const rows = await deleteForecastRecord(index)
+      setForecastRows(rows.map((item, i) => ({ ...item, originalIndex: i })).reverse())
+    } catch (e) {
+      setForecastErr(e instanceof Error ? e.message : '删除预测记录失败')
+    } finally {
+      setForecastBusy(false)
+    }
+  }
+
+  const handleClearForecasts = async () => {
+    if (!window.confirm('确认清空全部预测记录？')) return
+    setForecastBusy(true)
+    setForecastErr('')
+    try {
+      await clearForecastHistory()
+      setForecastRows([])
+    } catch (e) {
+      setForecastErr(e instanceof Error ? e.message : '清空预测记录失败')
+    } finally {
+      setForecastBusy(false)
+    }
+  }
+
   const holdings = Object.values(portfolio?.holdings ?? {})
   const cash = portfolio?.cash ?? 0
+  const holdingTickers = new Set(holdings.map((item) => item.ticker))
+  const groupedForecasts = forecastRows.reduce<Record<string, ForecastRow[]>>((acc, item) => {
+    if (!acc[item.ticker]) acc[item.ticker] = []
+    acc[item.ticker].push(item)
+    return acc
+  }, {})
+  const forecastGroups = Object.entries(groupedForecasts)
+    .sort(([tickerA, rowsA], [tickerB, rowsB]) => {
+      const aHold = holdingTickers.has(tickerA) ? 1 : 0
+      const bHold = holdingTickers.has(tickerB) ? 1 : 0
+      if (aHold !== bHold) return bHold - aHold
+      return (rowsB[0]?.date ?? '').localeCompare(rowsA[0]?.date ?? '')
+    })
 
   let totalCost = 0
   let totalValue = 0
@@ -350,6 +544,52 @@ export default function PortfolioPage() {
             </table>
           </div>
         )}
+
+        <div className="mt-6 bg-slate-900 rounded-xl border border-slate-800 p-4">
+          <div className="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <History className="w-4 h-4 text-blue-400" />
+                <h2 className="text-sm font-semibold text-white">预测记录</h2>
+              </div>
+              <p className="text-xs text-slate-500 mt-1">按股票分组展示已保存预测，优先显示当前持仓标的。</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleClearForecasts}
+                disabled={forecastRows.length === 0 || forecastBusy}
+                className="px-3 py-1.5 rounded-lg bg-red-950/40 text-red-300 hover:text-white border border-red-900/40 text-xs transition-colors disabled:opacity-50"
+              >
+                清空记录
+              </button>
+            </div>
+          </div>
+
+          {forecastErr && (
+            <div className="mb-3 px-3 py-2 rounded-lg border border-red-900/40 bg-red-950/40 text-xs text-red-300">
+              {forecastErr}
+            </div>
+          )}
+
+          {forecastGroups.length === 0 ? (
+            <div className="h-32 flex items-center justify-center text-slate-600 text-sm">
+              暂无预测记录
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              {forecastGroups.map(([ticker, rows]) => (
+                <ForecastGroupCard
+                  key={ticker}
+                  ticker={ticker}
+                  rows={rows}
+                  isHolding={holdingTickers.has(ticker)}
+                  busy={forecastBusy}
+                  onDelete={handleDeleteForecast}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ── Edit modal ── */}
@@ -436,7 +676,7 @@ export default function PortfolioPage() {
                     className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
                   />
                 </div>
-                <p className="text-xs text-slate-600">直接修改持仓数量与成本价，不记录交易流水。</p>
+                <p className="text-xs text-slate-600">直接修改持仓数量与成本价，不记录交易流水。A股可输入 0 清空持仓，或输入不少于 100 股。</p>
               </div>
             )}
 

@@ -1,7 +1,24 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { Navigate } from 'react-router-dom'
 import { useAuth } from '@/store/useAuth'
-import { TrendingUp, Lock, User as UserIcon, Eye, EyeOff } from 'lucide-react'
+import { TrendingUp, Lock, User as UserIcon, Eye, EyeOff, ChevronDown, X } from 'lucide-react'
+
+const STORAGE_KEY = 'invest_saved_usernames'
+
+function loadSavedUsernames(): string[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? (JSON.parse(raw) as string[]) : ['admin']
+  } catch {
+    return ['admin']
+  }
+}
+
+function saveSavedUsernames(names: string[]) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(names))
+  } catch {}
+}
 
 export default function LoginPage() {
     const { login, register, user, isLoading } = useAuth()
@@ -11,8 +28,53 @@ export default function LoginPage() {
     const [displayName, setDisplayName] = useState('')
     const [showPwd, setShowPwd] = useState(false)
     const [error, setError] = useState('')
+    const [savedUsernames, setSavedUsernames] = useState<string[]>(loadSavedUsernames)
+    const [showDropdown, setShowDropdown] = useState(false)
+    const usernameRef = useRef<HTMLInputElement>(null)
+    const dropdownRef = useRef<HTMLDivElement>(null)
+
+    // 点击外部关闭下拉
+    useEffect(() => {
+      const handler = (e: MouseEvent) => {
+        if (
+          dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
+          usernameRef.current && !usernameRef.current.contains(e.target as Node)
+        ) {
+          setShowDropdown(false)
+        }
+      }
+      document.addEventListener('mousedown', handler)
+      return () => document.removeEventListener('mousedown', handler)
+    }, [])
 
     if (user) return <Navigate to="/monitor" replace />
+
+    // 登录成功后保存用户名
+    const persistUsername = (name: string) => {
+      if (!name.trim()) return
+      const updated = [name, ...savedUsernames.filter((u) => u !== name)].slice(0, 8)
+      setSavedUsernames(updated)
+      saveSavedUsernames(updated)
+    }
+
+    // 移除某个保存的用户名
+    const removeUsername = (name: string, e: React.MouseEvent) => {
+      e.stopPropagation()
+      const updated = savedUsernames.filter((u) => u !== name)
+      setSavedUsernames(updated)
+      saveSavedUsernames(updated)
+    }
+
+    // 从下拉选择用户名
+    const selectUsername = (name: string) => {
+      setUsername(name)
+      setShowDropdown(false)
+      // 自动聚焦密码框
+      setTimeout(() => {
+        const pwd = document.querySelector<HTMLInputElement>('input[type="password"], input[name="password"]')
+        pwd?.focus()
+      }, 50)
+    }
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault()
@@ -20,14 +82,21 @@ export default function LoginPage() {
         try {
             if (mode === 'login') {
                 await login(username, password)
+                persistUsername(username)
             } else {
                 if (!displayName.trim()) { setError('请填写昵称'); return }
                 await register(username, password, displayName)
+                persistUsername(username)
             }
         } catch (err: any) {
             setError(err.message ?? '操作失败，请重试')
         }
     }
+
+    // 下拉候选：与当前输入匹配的已保存用户名
+    const dropdownItems = savedUsernames.filter((u) =>
+      !username || u.toLowerCase().includes(username.toLowerCase())
+    )
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900
@@ -80,21 +149,64 @@ export default function LoginPage() {
                             </div>
                         )}
 
-                        {/* Username */}
+                        {/* Username — 带历史下拉 */}
                         <div>
                             <label className="text-sm text-slate-300 mb-1.5 block">用户名</label>
                             <div className="relative">
-                                <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 z-10" />
                                 <input
+                                    ref={usernameRef}
                                     value={username}
-                                    onChange={(e) => setUsername(e.target.value)}
-                                    placeholder="输入用户名"
-                                    autoComplete="username"
+                                    onChange={(e) => { setUsername(e.target.value); setShowDropdown(true) }}
+                                    onFocus={() => setShowDropdown(dropdownItems.length > 0)}
+                                    placeholder="输入或选择用户名"
+                                    autoComplete="off"
                                     required
-                                    className="w-full pl-10 pr-4 py-2.5 bg-slate-900/60 border border-slate-600
+                                    className="w-full pl-10 pr-8 py-2.5 bg-slate-900/60 border border-slate-600
                              rounded-xl text-white placeholder-slate-500 focus:border-blue-500
                              focus:ring-1 focus:ring-blue-500 outline-none text-sm"
                                 />
+                                {/* 展开/收起按钮 */}
+                                {savedUsernames.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setShowDropdown((v) => !v)}
+                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors"
+                                  >
+                                    <ChevronDown className={`w-4 h-4 transition-transform ${showDropdown ? 'rotate-180' : ''}`} />
+                                  </button>
+                                )}
+
+                                {/* 下拉列表 */}
+                                {showDropdown && dropdownItems.length > 0 && (
+                                  <div
+                                    ref={dropdownRef}
+                                    className="absolute top-full left-0 right-0 mt-1 bg-slate-800 border border-slate-700
+                                               rounded-xl shadow-xl z-50 overflow-hidden"
+                                  >
+                                    <p className="text-[10px] text-slate-500 px-3 pt-2 pb-1">历史登录账号</p>
+                                    {dropdownItems.map((name) => (
+                                      <div
+                                        key={name}
+                                        onClick={() => selectUsername(name)}
+                                        className="flex items-center gap-2 px-3 py-2 hover:bg-slate-700/60
+                                                   cursor-pointer transition-colors group"
+                                      >
+                                        <UserIcon className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
+                                        <span className="flex-1 text-sm text-slate-200">{name}</span>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => removeUsername(name, e)}
+                                          className="opacity-0 group-hover:opacity-100 text-slate-500
+                                                     hover:text-red-400 transition-all"
+                                          title="移除记录"
+                                        >
+                                          <X className="w-3.5 h-3.5" />
+                                        </button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
                             </div>
                         </div>
 

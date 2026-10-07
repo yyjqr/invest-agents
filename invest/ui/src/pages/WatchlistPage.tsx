@@ -6,21 +6,20 @@
  */
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Activity, Bell, ChevronDown, ChevronRight, Plus, RefreshCw, Search, Sparkles, Star, Trash2, TrendingUp, X } from 'lucide-react'
+import { Activity, Bell, BarChart3, ChevronDown, ChevronRight, Plus, RefreshCw, Search, Sparkles, Star, Trash2, TrendingUp, X } from 'lucide-react'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { useWatchlist } from '@/store/useWatchlist'
-import {
-  deleteAlert,
-  fetchAlerts,
+import { deleteAlert, fetchAlerts,
   fetchBatchQuotes,
   fetchForecast,
        fetchSmartPicks,
+  fetchWatchlistRanked,
   PriceWebSocket,
   refreshSmartPicks,
   searchStocks,
   setAlert,
 } from '@/api/client'
-import type { Forecast, PriceAlert, Quote, SearchResult, SmartPickItem } from '@/types'
+import type { Forecast, PriceAlert, Quote, SearchResult, SmartPickItem, WatchlistRankedItem } from '@/types'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 const fmt2 = (n: number) => n.toFixed(2)
@@ -70,6 +69,12 @@ export default function WatchlistPage() {
   const [smartUpdatedAt, setSmartUpdatedAt] = useState('')
   const [smartLoading, setSmartLoading] = useState(false)
   const [smartCollapsed, setSmartCollapsed] = useState(false)
+  // ranked tab
+  const [activeTab, setActiveTab] = useState<'watchlist' | 'ranked'>('watchlist')
+  const [rankedData, setRankedData] = useState<WatchlistRankedItem[]>([])
+  const [rankedUpdatedAt, setRankedUpdatedAt] = useState('')
+  const [rankedLoading, setRankedLoading] = useState(false)
+  const [rankedError, setRankedError] = useState<string | null>(null)
 
   // ── data loading ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -196,6 +201,20 @@ export default function WatchlistPage() {
     finally { setSmartLoading(false) }
   }
 
+  const loadRanked = async () => {
+    setRankedLoading(true)
+    setRankedError(null)
+    try {
+      const r = await fetchWatchlistRanked()
+      setRankedData(r.ranked)
+      setRankedUpdatedAt(r.updated_at)
+    } catch (e) {
+      setRankedError('后端服务连接失败，请确认服务器已启动后重试')
+    } finally {
+      setRankedLoading(false)
+    }
+  }
+
   const toggleForecast = async (ticker: string) => {
     if (expandedFc === ticker) { setExpandedFc(null); return }
     setAlertEditor(null)
@@ -272,14 +291,41 @@ export default function WatchlistPage() {
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="px-6 py-4 border-b border-slate-800">
-        <h1 className="text-lg font-bold text-white">自选股</h1>
-        <p className="text-xs text-slate-500 mt-0.5">
-          {items.length} 只股票 · 🔔 价格预警 &amp; 📈 AI 预测
-        </p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold text-white">自选股</h1>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {items.length} 只股票 · 🔔 价格预警 &amp; 📈 AI 预测
+            </p>
+          </div>
+          {/* Tab switcher */}
+          <div className="flex items-center gap-1 bg-slate-800/60 rounded-lg p-1">
+            <button
+              onClick={() => setActiveTab('watchlist')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors
+                ${activeTab === 'watchlist'
+                  ? 'bg-slate-700 text-white'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              <Star className="w-3 h-3" />
+              自选列表
+            </button>
+            <button
+              onClick={() => { setActiveTab('ranked'); if (!rankedData.length) loadRanked() }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors
+                ${activeTab === 'ranked'
+                  ? 'bg-indigo-600/80 text-white'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              <BarChart3 className="w-3 h-3" />
+              推荐排名
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Smart Picks panel */}
-      <div className="border-b border-slate-800">
+      {/* Smart Picks panel + watchlist table — only in watchlist tab */}
+      {activeTab === 'watchlist' && <><div className="border-b border-slate-800">
         {/* Smart picks header row */}
         <div
           className="flex items-center justify-between px-6 py-2.5 cursor-pointer
@@ -699,7 +745,176 @@ export default function WatchlistPage() {
             </tbody>
           </table>
         )}
-      </div>
+      </div></>}
+
+      {/* ── 推荐排名 tab ────────────────────────────────────────────────────── */}
+      {activeTab === 'ranked' && (
+        <div className="flex-1 overflow-y-auto">
+          {/* Ranked header */}
+          <div className="flex items-center justify-between px-6 py-3 border-b border-slate-800 sticky top-0 bg-slate-900 z-10">
+            <div className="flex items-center gap-2">
+              <BarChart3 className="w-4 h-4 text-indigo-400" />
+              <span className="text-sm font-semibold text-white">BMP 算法推荐排名</span>
+              {rankedUpdatedAt && (
+                <span className="text-xs text-slate-500">
+                  更新于 {new Date(rankedUpdatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+            </div>
+            <button
+              onClick={loadRanked}
+              disabled={rankedLoading}
+              className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-600/20 border border-indigo-500/30
+                         text-indigo-300 text-xs hover:bg-indigo-600/30 disabled:opacity-50 transition-colors"
+            >
+              <RefreshCw className={`w-3 h-3 ${rankedLoading ? 'animate-spin' : ''}`} />
+              {rankedLoading ? '分析中...' : '重新分析'}
+            </button>
+          </div>
+
+          {/* 错误状态 */}
+          {rankedError && (
+            <div className="flex flex-col items-center justify-center py-12 gap-2">
+              <p className="text-sm text-rose-400">{rankedError}</p>
+              <button onClick={loadRanked} className="text-xs text-indigo-400 hover:text-indigo-300 underline">
+                重新尝试
+              </button>
+            </div>
+          )}
+
+          {/* 首次加载中（无历史数据）*/}
+          {rankedLoading && !rankedData.length && !rankedError && (
+            <div className="flex flex-col items-center justify-center py-20 gap-3">
+              <RefreshCw className="w-6 h-6 text-indigo-400 animate-spin" />
+              <p className="text-sm text-slate-400">正在对全部自选股进行 BMP 价值分析，请稍候...</p>
+              <p className="text-xs text-slate-600">首次分析需要从财报数据源拉取数据，约需 15-30 秒</p>
+            </div>
+          )}
+
+          {!rankedLoading && !rankedData.length && !rankedError && (
+            <div className="flex flex-col items-center justify-center py-20 gap-3">
+              <BarChart3 className="w-8 h-8 text-slate-600" />
+              <p className="text-sm text-slate-500">点击「重新分析」对关注股票进行 BMP 推荐评分</p>
+            </div>
+          )}
+
+          {/* 刷新中但已有历史数据时，顶部显示 loading 条 */}
+          {rankedLoading && rankedData.length > 0 && (
+            <div className="px-6 py-2 flex items-center gap-2">
+              <RefreshCw className="w-3 h-3 text-indigo-400 animate-spin" />
+              <span className="text-xs text-slate-500">正在重新分析，结果即将更新...</span>
+            </div>
+          )}
+
+          {rankedData.length > 0 && (
+            <div className="divide-y divide-slate-800/60">
+              {rankedData.map((item) => {
+                const recColor: Record<string, string> = {
+                  bull: 'text-bull border-emerald-500/40 bg-emerald-950/20',
+                  neutral: 'text-amber-300 border-amber-500/40 bg-amber-950/20',
+                  bear: 'text-rose-400 border-rose-500/40 bg-rose-950/20',
+                  gray: 'text-slate-400 border-slate-600/40 bg-slate-800/20',
+                }
+                const colorClass = recColor[item.recommendation_color] ?? recColor.gray
+                const scoreColor = item.total_score == null ? 'text-slate-500'
+                  : item.total_score >= 65 ? 'text-bull'
+                  : item.total_score >= 50 ? 'text-amber-300'
+                  : 'text-rose-400'
+                const dqLabel: Record<string, string> = {
+                  full: '完整财报', quote_only: '行情估分', failed: '获取失败',
+                }
+
+                return (
+                  <div
+                    key={item.ticker}
+                    onClick={() => navigate(`/stock/${item.ticker.split('.')[0]}`)}
+                    className="flex items-center gap-4 px-6 py-4 hover:bg-slate-800/30 cursor-pointer transition-colors"
+                  >
+                    {/* Rank badge */}
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0
+                      ${item.rank === 1 ? 'bg-yellow-500/20 text-yellow-300 ring-1 ring-yellow-500/50'
+                        : item.rank === 2 ? 'bg-slate-400/20 text-slate-300 ring-1 ring-slate-400/40'
+                        : item.rank === 3 ? 'bg-amber-700/20 text-amber-500 ring-1 ring-amber-700/40'
+                        : 'bg-slate-800 text-slate-500'}`}>
+                      {item.rank}
+                    </div>
+
+                    {/* Name & ticker */}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-white truncate">{item.name}</span>
+                        <span className="text-[10px] text-slate-500 font-mono">{item.ticker.split('.')[0]}</span>
+                        {item.degraded && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-400 border border-slate-700">
+                            {dqLabel[item.data_quality]}
+                          </span>
+                        )}
+                      </div>
+                      {item.financials_summary?.sector && (
+                        <p className="text-[10px] text-slate-500 mt-0.5">{item.financials_summary.sector}</p>
+                      )}
+                    </div>
+
+                    {/* BMP score bars */}
+                    <div className="hidden md:flex items-center gap-3 flex-shrink-0">
+                      {(['value_score', 'growth_score', 'quality_score'] as const).map((key) => {
+                        const val = item[key]
+                        const labels: Record<string, string> = { value_score: '价值', growth_score: '成长', quality_score: '质量' }
+                        return (
+                          <div key={key} className="flex flex-col items-center gap-1 w-12">
+                            <span className="text-[9px] text-slate-500">{labels[key]}</span>
+                            <div className="w-full h-1 bg-slate-700 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-indigo-400 rounded-full transition-all"
+                                style={{ width: `${Math.min(val ?? 0, 100)}%` }}
+                              />
+                            </div>
+                            <span className="text-[9px] text-slate-400 font-mono">{val != null ? val.toFixed(0) : '—'}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+
+                    {/* F-Score */}
+                    {item.f_score != null && (
+                      <div className="flex-shrink-0 text-center w-10">
+                        <p className="text-[9px] text-slate-500">F分</p>
+                        <p className={`text-sm font-bold font-mono
+                          ${item.f_score >= 7 ? 'text-bull' : item.f_score >= 5 ? 'text-amber-300' : 'text-rose-400'}`}>
+                          {item.f_score}/9
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Total score */}
+                    <div className="flex-shrink-0 text-center w-14">
+                      <p className="text-[9px] text-slate-500">综合分</p>
+                      <p className={`text-base font-bold font-mono ${scoreColor}`}>
+                        {item.total_score != null ? item.total_score.toFixed(0) : '—'}
+                      </p>
+                    </div>
+
+                    {/* Recommendation tag */}
+                    <div className={`flex-shrink-0 px-2.5 py-1 rounded-lg border text-xs font-medium ${colorClass}`}>
+                      {item.recommendation}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Disclaimer */}
+          {rankedData.length > 0 && (
+            <div className="px-6 py-4 border-t border-slate-800">
+              <p className="text-[10px] text-slate-600 leading-relaxed">
+                💡 推荐排名基于 Piotroski F-Score + Buffett/Munger/Dalio 三维因子（价值·成长·质量）综合评分，仅供研究参考，不构成投资建议。
+                行情估分（无财报）仅依赖 PE/PB 启发式评估，精度有限。
+              </p>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
