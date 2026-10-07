@@ -113,6 +113,57 @@ def _cn_market_prefix(ticker: str) -> str | None:
     return None
 
 
+def _parse_tencent_fields(fields: list[str]) -> dict | None:
+    """Parse all fields from a Tencent `~`-split quote line into a flat dict.
+
+    Field layout (0-indexed):
+      [1] name, [2] code, [3] last, [4] prev_close,
+      [36] volume(手), [37] turnover(万元), [38] turnover_rate(%),
+      [39] PE(TTM), [43] PB, [44] total_mktcap(亿), [45] float_mktcap(亿)
+
+    Returns None if the line is too short or price fields are unparseable.
+    """
+    if len(fields) < 33:
+        return None
+
+    code = fields[2]
+    name = fields[1] or code
+
+    try:
+        current = float(fields[3])
+        prev = float(fields[4])
+    except (ValueError, IndexError):
+        return None
+
+    change = current - prev
+    change_pct = (change / prev * 100) if prev else 0.0
+
+    def _f(idx: int) -> float | None:
+        try:
+            v = fields[idx] if len(fields) > idx else ""
+            return float(v) if v else None
+        except (ValueError, IndexError):
+            return None
+
+    raw_turnover = _f(37)
+    return {
+        "code": code,
+        "name": name,
+        "current": current,
+        "prev": prev,
+        "change": change,
+        "change_pct": change_pct,
+        "volume": _f(36),
+        # 万元 → 元
+        "turnover": raw_turnover * 10_000 if raw_turnover is not None else None,
+        "turnover_rate": _f(38),
+        "pe_ttm": _f(39),
+        "pb_ratio": _f(43),
+        "market_cap_total": _f(44),
+        "market_cap_float": _f(45),
+    }
+
+
 def _try_cn_quote_tencent(ticker: str) -> Quote | None:
     """Try fetching China A-share quote from Tencent quote API.
 
@@ -135,56 +186,26 @@ def _try_cn_quote_tencent(ticker: str) -> Quote | None:
         return None
 
     # Example format: v_sh600519="1~贵州茅台~600519~1499.99~..."
-    if "\"" not in text:
+    if '"' not in text:
         return None
-    payload = text.split("\"", maxsplit=2)[1]
-    fields = payload.split("~")
-    if len(fields) < 33:
+    payload = text.split('"', maxsplit=2)[1]
+    parsed = _parse_tencent_fields(payload.split("~"))
+    if parsed is None:
         return None
-
-    name = fields[1] or code
-    last = fields[3]
-    prev_close = fields[4]
-
-    try:
-        current = float(last)
-        prev = float(prev_close)
-    except ValueError:
-        return None
-
-    change = current - prev
-    change_pct = (change / prev * 100) if prev else 0.0
-
-    # fields[36]=成交量(手), [37]=成交额(万元), [38]=换手率(%), [39]=PE(TTM), [43]=PB, [44]=总市值(亿), [45]=流通市值(亿)
-    def _f(idx: int) -> float | None:
-        try:
-            v = fields[idx] if len(fields) > idx else ""
-            return float(v) if v else None
-        except (ValueError, IndexError):
-            return None
-
-    raw_turnover = _f(37)
-    turnover = raw_turnover * 10_000 if raw_turnover is not None else None  # 万元 → 元
-    volume = _f(36)
-    pe_ttm = _f(39)
-    pb_ratio = _f(43)
-    market_cap_total = _f(44)
-    market_cap_float = _f(45)
-    turnover_rate = _f(38)
 
     return Quote(
-        ticker=normalize_ticker(code),
-        price=current,
-        change=change,
-        change_pct=change_pct,
-        name=name,
-        turnover=turnover,
-        volume=volume,
-        pe_ttm=pe_ttm,
-        pb_ratio=pb_ratio,
-        market_cap_total=market_cap_total,
-        market_cap_float=market_cap_float,
-        turnover_rate=turnover_rate,
+        ticker=normalize_ticker(parsed["code"]),
+        price=parsed["current"],
+        change=parsed["change"],
+        change_pct=parsed["change_pct"],
+        name=parsed["name"],
+        turnover=parsed["turnover"],
+        volume=parsed["volume"],
+        pe_ttm=parsed["pe_ttm"],
+        pb_ratio=parsed["pb_ratio"],
+        market_cap_total=parsed["market_cap_total"],
+        market_cap_float=parsed["market_cap_float"],
+        turnover_rate=parsed["turnover_rate"],
     )
 
 
@@ -792,46 +813,24 @@ def get_batch_quotes_tencent(codes: list[str]) -> list[Quote]:
                 if '"' not in line:
                     continue
                 payload = line.split('"', maxsplit=2)[1]
-                fields = payload.split("~")
-                if len(fields) < 33:
+                parsed = _parse_tencent_fields(payload.split("~"))
+                if parsed is None:
                     continue
 
-                name = fields[1]
-                code = fields[2]
-                last = fields[3]
-                prev_close = fields[4]
-
-                try:
-                    current = float(last)
-                    prev = float(prev_close)
-                except ValueError:
-                    continue
-
-                change = current - prev
-                change_pct = (change / prev * 100) if prev else 0.0
-
-                turnover: float | None = None
-                volume: float | None = None
-                try:
-                    if len(fields) > 37 and fields[37]:
-                        turnover = float(fields[37]) * 10_000
-                except (ValueError, IndexError):
-                    pass
-                try:
-                    if len(fields) > 36 and fields[36]:
-                        volume = float(fields[36])
-                except (ValueError, IndexError):
-                    pass
-
-                normalized = normalize_ticker(code)
+                normalized = normalize_ticker(parsed["code"])
                 results.append(Quote(
                     ticker=normalized,
-                    price=current,
-                    change=change,
-                    change_pct=change_pct,
-                    name=name,
-                    turnover=turnover,
-                    volume=volume,
+                    price=parsed["current"],
+                    change=parsed["change"],
+                    change_pct=parsed["change_pct"],
+                    name=parsed["name"],
+                    turnover=parsed["turnover"],
+                    volume=parsed["volume"],
+                    pe_ttm=parsed["pe_ttm"],
+                    pb_ratio=parsed["pb_ratio"],
+                    market_cap_total=parsed["market_cap_total"],
+                    market_cap_float=parsed["market_cap_float"],
+                    turnover_rate=parsed["turnover_rate"],
                 ))
                 result_codes.add(normalized.split(".", maxsplit=1)[0])
 

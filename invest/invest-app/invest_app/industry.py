@@ -114,7 +114,11 @@ SHENWAN_L1_TO_META: dict[str, str] = {
 
 
 def classify_sector(ticker: str, name: str = "") -> str:
-    """Classify a ticker into a sector based on name keywords."""
+    """Classify a ticker into a sector by curated name, then name keywords."""
+    if name:
+        known = _NAME_TO_SECTOR.get(name)
+        if known:
+            return known
     combined = f"{name} {ticker}".upper()
     for sector, keywords in _SECTOR_KEYWORDS.items():
         for kw in keywords:
@@ -460,6 +464,13 @@ SECTOR_STOCKS: dict[str, list[SectorStock]] = {
         SectorStock("600598.SS", "北大荒",    "千万亩耕地粮食生产国家队"),
         SectorStock("300119.SZ", "瑞普生物",  "猪禽水产动物疫苗与保健品"),
     ],
+}
+
+# Curated short-name → 申万一级行业 lookup, derived from SECTOR_STOCKS.  Preferred
+# over keyword matching because many large-caps (美的/平安/格力…) don't contain
+# their industry keyword in their name.
+_NAME_TO_SECTOR: dict[str, str] = {
+    s.name: sector for sector, stocks in SECTOR_STOCKS.items() for s in stocks
 }
 
 # Major market indices — displayed at the top of the sector page

@@ -26,6 +26,9 @@ Endpoints:
   DELETE/api/alerts/{ticker}     — delete one alert rule
   GET   /api/smart-picks         — 智能精选（TTL 缓存）
   POST  /api/smart-picks/refresh — 强制刷新智能精选
+    GET   /api/value-picks         — 价值精选（TTL 缓存）
+    POST  /api/value-picks/refresh — 强制刷新价值精选
+    GET   /api/value-picks/brief   — 轻量价值精选摘要
   WS    /ws/prices               — realtime price stream (5s push)
 """
 
@@ -169,6 +172,7 @@ def _quote_from_last_close(ticker: str):
 async def lifespan(app: FastAPI):
     ensure_default_admin()
     _start_news_background(interval_sec=120)
+    _manager.start_broadcaster()
     logger.info("Invest-app FastAPI server started (default admin: admin/admin123)")
     yield
 
@@ -505,6 +509,356 @@ async def get_stock_profile(
     except Exception as e:
         logger.error(f"Profile error {ticker}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# BMP 价值分析 — F-Score + 护城河 + 三维因子评分
+# ---------------------------------------------------------------------------
+
+def _quote_partial_score(quote) -> tuple[float, dict]:
+    """Estimate a basic BMP-style total score using only quote data.
+
+    Used as a fallback when financial statements are unavailable.
+    Scores PE and PB heuristically relative to common A-share market ranges.
+    Returns (total_score 0-100, factors_dict).
+    """
+    pe = quote.pe_ttm if quote else None
+    pb = quote.pb_ratio if quote else None
+    factors: dict = {}
+    components: list[float] = []
+
+    # PE heuristic: score against typical A-share ranges
+    if pe is not None:
+        if pe <= 0:
+            pe_s = 10.0   # loss-making
+        elif pe < 10:
+            pe_s = 85.0
+        elif pe < 20:
+            pe_s = 70.0
+        elif pe < 35:
+            pe_s = 50.0
+        elif pe < 60:
+            pe_s = 30.0
+        else:
+            pe_s = 12.0
+        components.append(pe_s * 0.5)
+        factors["pe_heuristic"] = round(pe_s, 1)
+
+    # PB heuristic
+    if pb is not None:
+        if pb <= 0:
+            pb_s = 10.0
+        elif pb < 1:
+            pb_s = 85.0
+        elif pb < 2:
+            pb_s = 70.0
+        elif pb < 4:
+            pb_s = 50.0
+        elif pb < 8:
+            pb_s = 28.0
+        else:
+            pb_s = 10.0
+        components.append(pb_s * 0.5)
+        factors["pb_heuristic"] = round(pb_s, 1)
+
+    if not components:
+        return 35.0, factors   # no quote data at all → below-average placeholder
+    total = sum(components) / (0.5 * len(components))   # re-normalise to 0-100
+    return round(min(max(total, 0), 100), 1), factors
+
+
+def _recommend_tag(score: float | None) -> tuple[str, str]:
+    """Return (tag_label, color_class) based on BMP total score."""
+    if score is None:
+        return "数据不足", "gray"
+    if score >= 65:
+        return "优先关注", "bull"
+    if score >= 50:
+        return "继续跟踪", "neutral"
+    if score >= 35:
+        return "谨慎观察", "bear"
+    return "暂不推荐", "bear"
+
+
+def _run_value_analysis(ticker: str) -> dict:
+    """Synchronous core of the value-analysis endpoint.
+
+    Returns a structured dict with F-Score breakdown, moat score, and the
+    full BMP value / growth / quality scoring.  Degrades gracefully when
+    financial data is unavailable (returns partial results with a 'degraded'
+    flag instead of raising).
+    """
+    from invest_app.financial_data import get_financials  # noqa: PLC0415
+    from invest_app.value_discovery import (  # noqa: PLC0415
+        SectorStats,
+        calculate_f_score,
+        score_value_stock,
+        _moat_score,
+        _owner_earnings_yield,
+    )
+
+    resolved = resolve_ticker(ticker)
+    quote = get_quote(resolved)
+
+    # Financial statements — may be None if akshare is unreachable
+    fs = get_financials(resolved)
+    degraded = fs is None
+
+    # ── Quote data (always available via Tencent HTTP) ──────────────────
+    quote_data = {
+        "ticker": resolved,
+        "name": quote.name if quote else resolved,
+        "price": quote.price if quote else None,
+        "pe_ttm": quote.pe_ttm if quote else None,
+        "pb_ratio": quote.pb_ratio if quote else None,
+        "market_cap_total": quote.market_cap_total if quote else None,
+        "turnover_rate": quote.turnover_rate if quote else None,
+    }
+
+    if fs is None:
+        # Compute a partial score from quote data alone so the ticker is still
+        # comparable to others in ranked views (marked as degraded).
+        partial_score, partial_factors = _quote_partial_score(quote)
+        rec_tag, rec_color = _recommend_tag(partial_score)
+        # Determine likely degraded reason: ETF/fund/BJ-exchange or network
+        code_plain = resolved.split(".")[0]
+        if resolved.endswith(".BJ") or (code_plain.startswith("83") or code_plain.startswith("87") or code_plain.startswith("43")):
+            deg_reason = "北交所/三板股票暂不支持财务分析，显示行情估分"
+        elif code_plain.startswith("5") or code_plain.startswith("15") or code_plain.startswith("16"):
+            deg_reason = "基金/ETF 无财务报表，显示行情估分"
+        else:
+            deg_reason = "财务数据暂时获取失败，显示行情估分（可稍后重试）"
+        return {
+            **quote_data,
+            "f_score": None,
+            "f_label": "无财报",
+            "f_checks": {},
+            "moat_score": None,
+            "moat_detail": {},
+            "owner_earnings_yield": None,
+            "value_score": None,
+            "growth_score": None,
+            "quality_score": partial_score,
+            "total_score": partial_score,
+            "recommendation": rec_tag,
+            "recommendation_color": rec_color,
+            "factors": partial_factors,
+            "financials_summary": {},
+            "degraded": True,
+            "degraded_reason": deg_reason,
+        }
+
+    # ── F-Score ──────────────────────────────────────────────────────────
+    f_breakdown = calculate_f_score(fs)
+    f_score = f_breakdown.f_score if f_breakdown else None
+    f_label = f_breakdown.label if f_breakdown else "数据不足"
+    f_checks = f_breakdown.checks if f_breakdown else {}
+
+    # ── Moat score (standalone) ───────────────────────────────────────────
+    moat_val, moat_detail = _moat_score(fs)
+    oey = _owner_earnings_yield(fs, quote)
+
+    # ── Full BMP scoring ─────────────────────────────────────────────────
+    from invest_app.value_discovery import FScoreBreakdown  # noqa: PLC0415
+    if f_breakdown is None:
+        f_breakdown = FScoreBreakdown(
+            ticker=fs.ticker, name=fs.name, sector=fs.sector,
+            f_score=0, label="数据不足", checks={}, is_financial_sector=False,
+        )
+
+    dr = fs.debt_ratio()
+    sector_stats = {fs.sector: SectorStats(debt_ratios=[dr] if dr is not None else [])}
+    market_regime = "震荡"
+    weights = {"value": 0.30, "growth": 0.30, "quality": 0.40}
+
+    from datetime import datetime  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+    now_iso = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+
+    item = score_value_stock(
+        f_breakdown, fs, quote, sector_stats, market_regime, weights,
+        picked_at=now_iso,
+    )
+
+    return {
+        **quote_data,
+        # F-Score
+        "f_score": f_score,
+        "f_label": f_label,
+        "f_checks": f_checks,
+        # Moat (standalone breakdown for UI display)
+        "moat_score": round(moat_val, 2),
+        "moat_detail": moat_detail,
+        "owner_earnings_yield": oey,
+        # BMP dimension scores
+        "value_score": item.value_score,
+        "growth_score": item.growth_score,
+        "quality_score": item.quality_score,
+        "total_score": item.total_score,
+        "market_regime": market_regime,
+        # All individual factors (for detail panel)
+        "factors": {
+            "pe_percentile": item.factors.pe_percentile,
+            "pb_percentile": item.factors.pb_percentile,
+            "dividend_yield": item.factors.dividend_yield,
+            "fcf_to_ev": item.factors.fcf_to_ev,
+            "owner_earnings_yield": item.factors.owner_earnings_yield,
+            "revenue_cagr_3y": item.factors.revenue_cagr_3y,
+            "net_profit_cagr_3y": item.factors.net_profit_cagr_3y,
+            "rd_intensity": item.factors.rd_intensity,
+            "roe_3y_avg": item.factors.roe_3y_avg,
+            "gross_margin_stability": item.factors.gross_margin_stability,
+            "ocf_to_profit": item.factors.ocf_to_profit,
+            "debt_ratio": item.factors.debt_ratio,
+            "profit_stability": item.factors.profit_stability,
+            "revenue_stability": item.factors.revenue_stability,
+            "moat_score": item.factors.moat_score,
+        },
+        # Raw financials summary (for transparency)
+        "financials_summary": {
+            "report_date": fs.report_date,
+            "sector": fs.sector,
+            "gross_margin": round(fs.gross_margin * 100, 2) if fs.gross_margin else None,
+            "roe": round(fs.roe * 100, 2) if fs.roe else None,
+            "debt_ratio": round(dr * 100, 2) if dr else None,
+            "ocf": fs.operating_cf,
+            "net_profit": fs.net_profit,
+            "revenue": fs.revenue,
+        },
+        "degraded": degraded,
+        "degraded_reason": None,
+        **{"recommendation": _recommend_tag(item.total_score)[0],
+           "recommendation_color": _recommend_tag(item.total_score)[1]},
+    }
+
+
+@app.get("/api/stocks/value-analysis/{ticker}")
+async def get_value_analysis(
+    ticker: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = security,
+):
+    """BMP 价值投资全量分析 — Piotroski F-Score + 护城河 + 三维评分.
+
+    返回结构：
+      - quote_data: 实时行情（腾讯 HTTP，始终可用）
+      - f_score/f_label/f_checks: Piotroski 九项检测明细
+      - moat_score/moat_detail: 护城河评分（毛利率水平+ROE水平+毛利率稳定性）
+      - owner_earnings_yield: 股东盈利收益率 = OCF/市值（Buffett proxy）
+      - value_score/growth_score/quality_score/total_score: BMP 三维得分
+      - factors: 所有底层因子（PE百分位/CAGR/OCF质量等）
+      - financials_summary: 关键财务数字摘要（透明度）
+      - degraded: 财务数据是否降级（仅行情可用时为 true）
+    """
+    _get_current_user(_bearer(credentials))
+    try:
+        result = await asyncio.to_thread(_run_value_analysis, ticker)
+        return result
+    except Exception as e:
+        logger.error(f"Value analysis error {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Watchlist ranked — BMP 算法推荐排名
+# ---------------------------------------------------------------------------
+
+@app.get("/api/watchlist/ranked")
+async def get_watchlist_ranked(
+    credentials: Optional[HTTPAuthorizationCredentials] = security,
+):
+    """对当前用户的关注列表做 BMP 算法评分并排序返回.
+
+    并发对每只股票调用 _run_value_analysis：
+    - 财务数据可用时 → 返回完整 F-Score + 三维 BMP 评分
+    - 财务数据不可用时 → 返回行情估分（degraded=true）
+    每条结果附带:
+      - rank: 当前排名（1 = 最值得关注）
+      - recommendation: 优先关注 / 继续跟踪 / 谨慎观察 / 暂不推荐 / 数据不足
+      - data_quality: "full" | "quote_only" | "failed"
+    """
+    from datetime import datetime  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    user = _get_current_user(_bearer(credentials))
+    watchlist = user_data.load_watchlist(user["sub"])
+
+    if not watchlist:
+        return {"ranked": [], "updated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(), "count": 0}
+
+    tickers = [item["ticker"] for item in watchlist]
+    name_map = {item["ticker"]: item.get("name", item["ticker"]) for item in watchlist}
+    note_map = {item["ticker"]: item.get("note", "") for item in watchlist}
+
+    # Concurrent analysis with per-stock timeout of 30s
+    async def _analyse_one(t: str) -> dict:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_run_value_analysis, t),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "ticker": t, "name": name_map.get(t, t), "price": None,
+                "pe_ttm": None, "pb_ratio": None, "market_cap_total": None,
+                "f_score": None, "f_label": "超时", "f_checks": {},
+                "moat_score": None, "moat_detail": {}, "owner_earnings_yield": None,
+                "value_score": None, "growth_score": None, "quality_score": None,
+                "total_score": None, "recommendation": "数据不足",
+                "recommendation_color": "gray", "factors": {}, "financials_summary": {},
+                "degraded": True, "degraded_reason": "分析超时，请稍后重试",
+                "data_quality": "failed",
+            }
+        except Exception as exc:
+            logger.warning(f"Watchlist ranked: analysis failed for {t}: {exc}")
+            return {
+                "ticker": t, "name": name_map.get(t, t), "price": None,
+                "pe_ttm": None, "pb_ratio": None, "market_cap_total": None,
+                "f_score": None, "f_label": "错误", "f_checks": {},
+                "moat_score": None, "moat_detail": {}, "owner_earnings_yield": None,
+                "value_score": None, "growth_score": None, "quality_score": None,
+                "total_score": None, "recommendation": "数据不足",
+                "recommendation_color": "gray", "factors": {}, "financials_summary": {},
+                "degraded": True, "degraded_reason": f"分析异常: {exc}",
+                "data_quality": "failed",
+            }
+
+    results = await asyncio.gather(*[_analyse_one(t) for t in tickers])
+
+    ranked = []
+    for r in results:
+        t = r.get("ticker", "")
+        # Augment with note from watchlist
+        r["note"] = note_map.get(t, "")
+        # Determine data quality
+        if r.get("data_quality") == "failed":
+            dq = "failed"
+        elif r.get("degraded", False):
+            dq = "quote_only"
+        else:
+            dq = "full"
+        r["data_quality"] = dq
+        # Ensure recommendation fields exist
+        if "recommendation" not in r:
+            r["recommendation"], r["recommendation_color"] = _recommend_tag(r.get("total_score"))
+        ranked.append(r)
+
+    # Sort: full scores first (descending), then quote_only (descending), failed last
+    def _sort_key(item: dict):
+        dq = item.get("data_quality", "failed")
+        score = item.get("total_score") or 0.0
+        priority = {"full": 0, "quote_only": 1, "failed": 2}.get(dq, 2)
+        return (priority, -score)
+
+    ranked.sort(key=_sort_key)
+
+    for i, r in enumerate(ranked, 1):
+        r["rank"] = i
+
+    return {
+        "ranked": ranked,
+        "updated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+        "count": len(ranked),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1215,55 @@ async def refresh_smart_picks_api(
     return asdict(state)
 
 
+@app.get("/api/value-picks")
+async def get_value_picks_api(
+    credentials: Optional[HTTPAuthorizationCredentials] = security,
+):
+    _get_current_user(_bearer(credentials))
+    from invest_app.value_discovery import get_value_picks
+    try:
+        state = await asyncio.wait_for(
+            asyncio.to_thread(get_value_picks, False),
+            timeout=35.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="价值精选加载超时，请稍候重试")
+    from dataclasses import asdict
+    return asdict(state)
+
+
+@app.post("/api/value-picks/refresh")
+async def refresh_value_picks_api(
+    credentials: Optional[HTTPAuthorizationCredentials] = security,
+):
+    _get_current_user(_bearer(credentials))
+    from invest_app.value_discovery import refresh_value_picks
+    try:
+        state = await asyncio.wait_for(
+            asyncio.to_thread(refresh_value_picks),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="价值精选强制刷新超时，请稍候重试")
+    from dataclasses import asdict
+    return asdict(state)
+
+
+@app.get("/api/value-picks/brief")
+async def get_value_picks_brief_api(
+    credentials: Optional[HTTPAuthorizationCredentials] = security,
+):
+    _get_current_user(_bearer(credentials))
+    from invest_app.value_discovery import get_value_picks_brief
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(get_value_picks_brief, False),
+            timeout=20.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="价值精选摘要加载超时，请稍候重试")
+
+
 @app.get("/api/watchlist")
 async def get_watchlist(credentials: Optional[HTTPAuthorizationCredentials] = security):
     user = _get_current_user(_bearer(credentials))
@@ -1059,9 +1462,17 @@ async def api_edit_holding(
     ticker_upper = ticker.upper()
     if ticker_upper not in portfolio.holdings:
         raise HTTPException(404, f"持仓中未找到 {ticker_upper}")
-    if req.shares <= 0:
-        raise HTTPException(400, "持仓数量必须大于 0，清空请使用删除功能")
     holding = portfolio.holdings[ticker_upper]
+    if req.shares < 0:
+        raise HTTPException(400, "持仓数量不能为负数")
+    if holding.asset_type.value == "stock" and 0 < req.shares < 100:
+        raise HTTPException(400, "A股持仓数量应为 0 或不少于 100 股")
+    if req.shares == 0:
+        del portfolio.holdings[ticker_upper]
+        save_portfolio(portfolio, path)
+        return {"ok": True, "deleted": True}
+    if req.avg_cost_basis < 0:
+        raise HTTPException(400, "成本价不能为负数")
     holding.shares = req.shares
     holding.avg_cost_basis = req.avg_cost_basis
     save_portfolio(portfolio, path)
@@ -1248,18 +1659,113 @@ async def update_settings(
 # WebSocket — realtime price stream
 # ---------------------------------------------------------------------------
 
+# Fields sent to the frontend for each quote entry.
+# Extended fields (pe_ttm, pb_ratio, market_cap_total, turnover_rate) are included
+# since get_batch_quotes_tencent now parses them from the same single API call.
+def _quote_to_dict(q) -> dict:
+    return {
+        "ticker": q.ticker,
+        "price": q.price,
+        "change": q.change,
+        "change_pct": q.change_pct,
+        "name": q.name,
+        "turnover": q.turnover,
+        "volume": q.volume,
+        "pe_ttm": q.pe_ttm,
+        "pb_ratio": q.pb_ratio,
+        "market_cap_total": q.market_cap_total,
+        "turnover_rate": q.turnover_rate,
+    }
+
+
+def _ws_push_interval() -> int:
+    """Return the WebSocket push interval in seconds, based on CN market hours.
+
+    A-share trading sessions (CST / UTC+8):
+      Morning  09:30 – 11:30
+      Afternoon 13:00 – 15:00  (weekdays only)
+
+    During trading hours prices move continuously → push every 3 s.
+    Outside trading hours prices are static → push every 30 s to avoid
+    hammering Tencent with pointless requests.
+    """
+    return 3 if _is_cn_market_open() else 30
+
+
 class _PriceStreamManager:
-    """Manages WebSocket connections and broadcasts price updates."""
+    """Manages WebSocket connections and broadcasts price updates.
+
+    A single background task (_broadcaster) collects all unique tickers across
+    every active connection, fetches them **once** via get_batch_quotes_tencent,
+    then fans the result out to each connection.  This replaces the previous
+    per-connection push loop that caused N identical Tencent requests per cycle.
+    """
 
     def __init__(self):
         # conn_id → (websocket, tickers, stale_cache)
         # stale_cache: bare_code → last known quote dict; serves data when batch fetch misses
         self._connections: dict[str, tuple[WebSocket, list[str], dict[str, dict]]] = {}
+        self._broadcaster_task: asyncio.Task | None = None
 
-    async def connect(self, ws: WebSocket, conn_id: str, tickers: list[str]):
-        await ws.accept()
-        self._connections[conn_id] = (ws, tickers, {})
-        logger.info(f"WS connected: {conn_id}, tickers={tickers}")
+    def start_broadcaster(self) -> None:
+        """Start the global broadcast loop (called once at app startup)."""
+        if self._broadcaster_task is None or self._broadcaster_task.done():
+            self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
+
+    async def _broadcast_loop(self) -> None:
+        """Single loop: collect tickers → fetch once → fan-out to all connections."""
+        while True:
+            interval = _ws_push_interval()
+
+            # Snapshot connections to avoid mutation during iteration
+            snapshot = dict(self._connections)
+            if snapshot:
+                # Deduplicate all tickers across every connection
+                all_tickers: list[str] = list(
+                    {t for _, tickers, _ in snapshot.values() for t in tickers}
+                )
+
+                # One Tencent batch request for all unique tickers
+                try:
+                    realtime_quotes = await asyncio.wait_for(
+                        asyncio.to_thread(get_batch_quotes_tencent, all_tickers),
+                        timeout=8.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    realtime_quotes = []
+
+                quote_map = {
+                    q.ticker.split(".", maxsplit=1)[0]: q for q in realtime_quotes
+                }
+
+                dead: list[str] = []
+                for conn_id, (ws, tickers, stale_cache) in snapshot.items():
+                    if conn_id not in self._connections:
+                        continue  # disconnected during this cycle
+
+                    data: list[dict] = []
+                    for ticker in tickers:
+                        key = ticker.split(".", maxsplit=1)[0]
+                        q = quote_map.get(key)
+                        if q is not None:
+                            entry = _quote_to_dict(q)
+                            stale_cache[key] = entry
+                            data.append(entry)
+                        elif key in stale_cache:
+                            stale_entry = dict(stale_cache[key])
+                            stale_entry["stale"] = True
+                            data.append(stale_entry)
+
+                    if data:
+                        try:
+                            await ws.send_json({"type": "prices", "data": data})
+                        except Exception:
+                            dead.append(conn_id)
+
+                for conn_id in dead:
+                    self.disconnect(conn_id)
+
+            await asyncio.sleep(interval)
 
     def disconnect(self, conn_id: str):
         self._connections.pop(conn_id, None)
@@ -1269,88 +1775,6 @@ class _PriceStreamManager:
         if conn_id in self._connections:
             ws, _, stale_cache = self._connections[conn_id]
             self._connections[conn_id] = (ws, tickers, stale_cache)
-
-    async def push_prices(self, conn_id: str):
-        if conn_id not in self._connections:
-            return
-        ws, tickers, stale_cache = self._connections[conn_id]
-        if not tickers:
-            return
-        try:
-            # Always use batch quotes — Tencent returns last-close prices even during
-            # non-trading hours (weekends, evenings), so there is no need to skip this
-            # call and fall back to slow per-ticker get_history() calls.
-            try:
-                realtime_quotes = await asyncio.wait_for(
-                    asyncio.to_thread(get_batch_quotes_tencent, tickers),
-                    timeout=8.0,
-                )
-            except (asyncio.TimeoutError, Exception):
-                realtime_quotes = []
-
-            realtime_map = {
-                q.ticker.split(".", maxsplit=1)[0]: q for q in realtime_quotes
-            }
-
-            data: list[dict] = []
-            missing_tickers: list[str] = []
-
-            for ticker in tickers:
-                key = ticker.split(".", maxsplit=1)[0]
-                q = realtime_map.get(key)
-                if q is not None:
-                    entry = {
-                        "ticker": q.ticker,
-                        "price": q.price,
-                        "change": q.change,
-                        "change_pct": q.change_pct,
-                        "name": q.name,
-                        "turnover": q.turnover,
-                        "volume": q.volume,
-                    }
-                    stale_cache[key] = entry  # keep stale cache fresh
-                    data.append(entry)
-                elif key in stale_cache:
-                    # Serve last-known data with stale indicator rather than blocking
-                    stale_entry = dict(stale_cache[key])
-                    stale_entry["stale"] = True
-                    data.append(stale_entry)
-                else:
-                    missing_tickers.append(ticker)
-
-            # For tickers with no cached data at all, fetch individually in parallel
-            if missing_tickers:
-                async def _fetch_one(t: str) -> dict | None:
-                    try:
-                        q = await asyncio.wait_for(
-                            asyncio.to_thread(get_quote, t),
-                            timeout=5.0,
-                        )
-                        return {
-                            "ticker": q.ticker,
-                            "price": q.price,
-                            "change": q.change,
-                            "change_pct": q.change_pct,
-                            "name": q.name,
-                            "turnover": q.turnover,
-                            "volume": q.volume,
-                        }
-                    except Exception:
-                        return None
-
-                individual = await asyncio.gather(*[_fetch_one(t) for t in missing_tickers])
-                for t, entry in zip(missing_tickers, individual):
-                    if entry is not None:
-                        key = t.split(".", maxsplit=1)[0]
-                        stale_cache[key] = entry
-                        data.append(entry)
-
-            if not data:
-                return
-
-            await ws.send_json({"type": "prices", "data": data})
-        except Exception as e:
-            logger.warning(f"Push error {conn_id}: {e}")
 
 
 _manager = _PriceStreamManager()
@@ -1387,19 +1811,12 @@ async def ws_prices(websocket: WebSocket):
         await _safe_close()
         return
 
+    # Register connection with the global broadcaster
     _manager._connections[conn_id] = (websocket, tickers, {})
     logger.info(f"WS auth ok: {payload.get('sub')}, tickers={tickers}")
 
     try:
-        # Start push loop
-        async def _push_loop():
-            while conn_id in _manager._connections:
-                await _manager.push_prices(conn_id)
-                await asyncio.sleep(5)
-
-        push_task = asyncio.create_task(_push_loop())
-
-        # Listen for ticker updates from client
+        # Listen for ticker updates from client; price pushes are handled by _broadcaster
         while True:
             try:
                 msg_text = await asyncio.wait_for(websocket.receive_text(), timeout=60)
@@ -1413,8 +1830,6 @@ async def ws_prices(websocket: WebSocket):
                 break
             except Exception:
                 break
-
-        push_task.cancel()
     finally:
         _manager.disconnect(conn_id)
 
