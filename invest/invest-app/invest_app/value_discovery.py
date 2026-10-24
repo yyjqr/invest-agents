@@ -21,6 +21,7 @@ from invest_app.market_data import (
     get_fundamentals,
     get_history,
 )
+from invest_app.value_factors import valuation_percentile_score, weighted_mean_available
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -314,9 +315,7 @@ def calculate_f_score(financials: FinancialStatements) -> FScoreBreakdown | None
             financials.share_count is not None
             and financials.share_count_1y_ago not in (None, 0)
         ):
-            dilution = abs(financials.share_count - financials.share_count_1y_ago)
-            dilution /= financials.share_count_1y_ago
-            checks["F7"] = 1 if dilution <= 0.05 else 0
+            checks["F7"] = 1 if financials.share_count <= financials.share_count_1y_ago else 0
         else:
             checks["F7"] = 0
         checks["F9"] = _passes_increase(
@@ -517,6 +516,10 @@ def _scale_inverse(value: float | None, low: float, high: float) -> float:
     return 100.0 - _scale_linear(value, low, high)
 
 
+def _coalesce_score(value: float | None, default: float) -> float:
+    return default if value is None else value
+
+
 def _load_valuation_cache() -> dict[str, dict[str, Any]]:
     data = _load_json_cache(_VALUATION_CACHE_FILE, _VALUATION_HISTORY_TTL)
     if not data:
@@ -561,7 +564,7 @@ def _historical_valuation_percentiles(
     ticker: str,
     current_pe: float | None,
     current_pb: float | None,
-) -> tuple[float | None, float | None]:
+) -> tuple[float | None, float | None, float | None, float | None]:
     cache = _load_valuation_cache()
     code = ticker.split(".")[0]
     item = cache.get(code)
@@ -569,9 +572,9 @@ def _historical_valuation_percentiles(
         item = _fetch_valuation_history(code)
         cache[code] = item
         _save_valuation_cache(cache)
-    pe_pct = _percentile_rank(current_pe, item.get("pe", []))
-    pb_pct = _percentile_rank(current_pb, item.get("pb", []))
-    return pe_pct, pb_pct
+    pe_pct, pe_score = valuation_percentile_score(current_pe, item.get("pe", []))
+    pb_pct, pb_score = valuation_percentile_score(current_pb, item.get("pb", []))
+    return pe_pct, pb_pct, pe_score, pb_score
 
 
 def _calculate_cagr(current: float | None, old: float | None, years: int = 3) -> float | None:
@@ -772,7 +775,7 @@ def score_value_stock(
     fcf_to_ev = _fcf_to_ev(financials, quote)
     oey = _owner_earnings_yield(financials, quote)
 
-    pe_pct, pb_pct = _historical_valuation_percentiles(financials.ticker, pe, pb)
+    pe_pct, pb_pct, pe_score, pb_score = _historical_valuation_percentiles(financials.ticker, pe, pb)
     debt_pct = _percentile_rank(debt_ratio, bucket.debt_ratios)
 
     # ── Value score ────────────────────────────────────────────────────────
@@ -782,14 +785,17 @@ def score_value_stock(
     # Weight shift: earnings power raised to 30% because both Buffett and
     # Munger emphasise that cash generation is the only real value metric.
     earnings_power = fcf_to_ev if fcf_to_ev is not None else oey
-    ep_score = _scale_linear(earnings_power, 0, 12)  # 0% → 0 pts, 12%+ → 100 pts
-    value_score = round(
-        (100 - (pe_pct or 50.0)) * 0.25       # PE 历史百分位（低估值）
-        + (100 - (pb_pct or 50.0)) * 0.25     # PB 历史百分位（低估值）
-        + _scale_linear(dividend_yield, 0, 8) * 0.20   # 股息率（现金回报）
-        + ep_score * 0.30,                    # 盈利收益率（FCF/EV 或 OCF/市值）
-        2,
+    dividend_score = None if dividend_yield is None else _scale_linear(dividend_yield, 0, 8)
+    ep_score = None if earnings_power is None else _scale_linear(earnings_power, 0, 12)
+    value_score_raw, _ = weighted_mean_available(
+        [
+            (pe_score, 0.25),
+            (pb_score, 0.25),
+            (dividend_score, 0.20),
+            (ep_score, 0.30),
+        ]
     )
+    value_score = round(value_score_raw or 0.0, 2)
 
     revenue_cagr = _calculate_cagr(financials.revenue, financials.revenue_3y_ago)
     profit_cagr = _calculate_cagr(financials.net_profit, financials.net_profit_3y_ago)
@@ -823,20 +829,22 @@ def score_value_stock(
         ]
     )
     ocf_score, ocf_ratio = _ocf_quality_score(financials)
-    leverage_score = 100 - (debt_pct or 50.0)
+    leverage_score = None if debt_pct is None else 100 - debt_pct
     profit_stab_score, profit_stab_ratio = _earnings_stability_score(
         [financials.net_profit, financials.net_profit_1y_ago, financials.net_profit_2y_ago]
     )
     revenue_stab_score, revenue_stab_ratio = _earnings_stability_score(
         [financials.revenue, financials.revenue_1y_ago, financials.revenue_2y_ago]
     )
-    quality_score = round(
-        moat_val        * 0.35
-        + profit_stab_score * 0.25
-        + ocf_score     * 0.25
-        + leverage_score * 0.15,
-        2,
+    quality_score_raw, _ = weighted_mean_available(
+        [
+            (moat_val, 0.35),
+            (profit_stab_score, 0.25),
+            (ocf_score, 0.25),
+            (leverage_score, 0.15),
+        ]
     )
+    quality_score = round(quality_score_raw or 0.0, 2)
 
     total_score = round(
         value_score * weights["value"]
@@ -1009,8 +1017,9 @@ def _merge_pool(
     max_replace = _MAX_REPLACE_LARGE if len(underperforming) > 3 else _MAX_REPLACE
     keep_limit = _POOL_SIZE - max_replace
     keep = healthy[:keep_limit]
-
-    return _apply_sector_diversification(keep, ranked)
+    merged = _apply_sector_diversification(keep, ranked)
+    merged.sort(key=lambda item: (item.total_score, item.f_score), reverse=True)
+    return merged
 
 
 def _load_incremental_candidates(current: list[ValuePickItem]) -> list[str]:

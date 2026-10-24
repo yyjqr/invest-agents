@@ -10,6 +10,38 @@ from typing import Any
 from invest_app.config import DATA_DIR
 
 
+def _canonical_watchlist_ticker(ticker: str) -> str:
+    value = str(ticker or "").strip().upper()
+    if not value:
+        return ""
+    if "." in value:
+        base, suffix = value.split(".", maxsplit=1)
+        if len(base) == 6 and base.isdigit() and suffix in {"SS", "SZ", "BJ"}:
+            return base
+        return value
+    return value
+
+
+def _normalize_watchlist_items(items: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    index_by_ticker: dict[str, int] = {}
+    for raw in items:
+        ticker = _canonical_watchlist_ticker(raw.get("ticker", ""))
+        if not ticker:
+            continue
+        item = {
+            "ticker": ticker,
+            "name": raw.get("name", ""),
+            "note": raw.get("note", ""),
+        }
+        if ticker in index_by_ticker:
+            normalized[index_by_ticker[ticker]] = item
+        else:
+            index_by_ticker[ticker] = len(normalized)
+            normalized.append(item)
+    return normalized
+
+
 def _user_dir(username: str) -> Path:
     d = DATA_DIR / "users" / username
     d.mkdir(parents=True, exist_ok=True)
@@ -30,31 +62,45 @@ def load_watchlist(username: str) -> list[dict]:
         return []
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        return _normalize_watchlist_items(data) if isinstance(data, list) else []
     except Exception:
         return []
 
 
 def save_watchlist(username: str, items: list[dict]) -> None:
     f = _user_file(username, "watchlist.json")
-    f.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    f.write_text(
+        json.dumps(_normalize_watchlist_items(items), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def add_watchlist_item(username: str, ticker: str, name: str = "", note: str = "") -> list[dict]:
+    ticker = _canonical_watchlist_ticker(ticker)
     items = load_watchlist(username)
     if not any(i["ticker"] == ticker for i in items):
         items.append({"ticker": ticker, "name": name, "note": note})
+    else:
+        for item in items:
+            if item["ticker"] == ticker:
+                if name:
+                    item["name"] = name
+                if note:
+                    item["note"] = note
+                break
         save_watchlist(username, items)
     return items
 
 
 def remove_watchlist_item(username: str, ticker: str) -> list[dict]:
+    ticker = _canonical_watchlist_ticker(ticker)
     items = [i for i in load_watchlist(username) if i["ticker"] != ticker]
     save_watchlist(username, items)
     return items
 
 
 def update_watchlist_item(username: str, ticker: str, **kwargs: Any) -> list[dict]:
+    ticker = _canonical_watchlist_ticker(ticker)
     items = load_watchlist(username)
     for item in items:
         if item["ticker"] == ticker:
